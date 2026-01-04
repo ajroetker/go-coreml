@@ -9,7 +9,14 @@
 - Runtime compilation and execution
 - Basic operations (Add, Sub, Mul, Div, MatMul, Relu, Sigmoid, etc.)
 
-**Phases 3-5: This Document**
+**Phase 3: Complete** ✅
+- GoMLX Backend interface implementation
+- Builder, Executable, Buffer/DataInterface
+- 16 operations mapped to CoreML MIL
+- Integration tests passing
+- See [Implementation Notes](#phase-3-implementation-notes) below
+
+**Phases 4-5: Pending**
 
 ---
 
@@ -242,11 +249,97 @@ func TestGoMLXIntegration(t *testing.T) {
 ```
 
 **Tasks**:
-- [ ] Test basic operations through GoMLX API
-- [ ] Test multi-operation graphs
-- [ ] Test parameter passing
-- [ ] Test shape inference
+- [x] Test basic operations through GoMLX API
+- [x] Test multi-operation graphs
+- [x] Test parameter passing
+- [x] Test shape inference
 - [ ] Verify numerical correctness vs simplego backend
+
+---
+
+## Phase 3 Implementation Notes
+
+### Files Created
+
+Location: `github.com/gomlx/gomlx/backends/coreml/`
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `backend.go` | 134 | Backend interface, runtime integration, configuration |
+| `builder.go` | 284 | Builder interface wrapping go-coreml's model.Builder |
+| `executable.go` | 302 | Executable interface for model execution |
+| `buffer.go` | 271 | Buffer/DataInterface with sync.Pool buffer pooling |
+| `ops.go` | 401 | Operation mapping layer (16 ops implemented) |
+| `capabilities.go` | 57 | Supported operations and dtypes |
+| `register_darwin.go` | 11 | Backend registration on macOS |
+| `register_other.go` | 8 | No-op stub for other platforms |
+| `doc.go` | 37 | Package documentation |
+| `coreml_test.go` | 453 | Integration tests |
+
+### Implemented Operations
+
+| Category | Operations |
+|----------|------------|
+| **Unary** | Abs, Neg*, Exp, Log, Sqrt, Tanh, Logistic (Sigmoid) |
+| **Binary** | Add, Sub, Mul, Div |
+| **Shape** | Reshape, Transpose |
+| **Reduction** | ReduceSum, ReduceMax |
+| **Matrix** | DotGeneral (simple MatMul case) |
+
+*Neg is implemented as `mul(x, -1)` since CoreML lacks a native neg operator.
+
+### Key Implementation Discoveries
+
+1. **CoreML requires "main" function name**
+   - CoreML MIL programs must have a function named "main"
+   - Fixed by always using `model.NewBuilder("main")` regardless of user-provided name
+   - The user's name is preserved in the GoMLX Builder for identification
+
+2. **Missing CoreML operators**
+   - CoreML MIL doesn't have a native `neg` operator
+   - Implemented negation as `mul(x, -1)` with a scalar constant
+   - This pattern may apply to other missing operators
+
+3. **Buffer pooling**
+   - Implemented efficient memory reuse using `sync.Pool` keyed by (dtype, length)
+   - Follows the same pattern as simplego backend
+   - Reduces GC pressure for repeated executions
+
+4. **Build tags**
+   - `//go:build darwin` on all implementation files
+   - Stub `register_other.go` allows importing on non-macOS platforms without errors
+
+5. **Shape inference**
+   - Uses `github.com/gomlx/gomlx/backends/shapeinference` package
+   - Consistent with other backends
+
+### Test Results
+
+```
+=== RUN   TestBackendCreation      --- PASS
+=== RUN   TestBufferOperations     --- PASS
+=== RUN   TestSharedBuffer         --- PASS
+=== RUN   TestBuilderParameterAndConstant --- PASS
+=== RUN   TestAddOperation         --- PASS
+=== RUN   TestUnaryOperations      --- PASS (Abs, Neg, Exp, Sqrt)
+=== RUN   TestBinaryOperations     --- PASS (Add, Sub, Mul, Div)
+=== RUN   TestReshape              --- PASS
+=== RUN   TestReduceSum            --- PASS
+=== RUN   TestChainedOperations    --- PASS
+PASS ok github.com/gomlx/gomlx/backends/coreml 0.765s
+```
+
+### Usage
+
+```go
+import _ "github.com/gomlx/gomlx/backends/coreml"
+
+// Or set environment variable:
+// export GOMLX_BACKEND=coreml
+
+// Or create directly:
+backend, err := coreml.New("")
+```
 
 ---
 

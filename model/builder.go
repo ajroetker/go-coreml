@@ -33,6 +33,7 @@ const (
 	Int32   = milspec.DataType_INT32
 	Int64   = milspec.DataType_INT64
 	Bool    = milspec.DataType_BOOL
+	String  = milspec.DataType_STRING
 )
 
 // Value represents a named value in the MIL graph.
@@ -193,6 +194,19 @@ func createValue(dtype DType, shape []int64, data interface{}) *milspec.Value {
 				Bools: &milspec.TensorValue_RepeatedBools{Values: d},
 			},
 		}
+	case string:
+		// Handle string as a scalar string value
+		tensorVal = &milspec.TensorValue{
+			Value: &milspec.TensorValue_Strings{
+				Strings: &milspec.TensorValue_RepeatedStrings{Values: []string{d}},
+			},
+		}
+	case []string:
+		tensorVal = &milspec.TensorValue{
+			Value: &milspec.TensorValue_Strings{
+				Strings: &milspec.TensorValue_RepeatedStrings{Values: d},
+			},
+		}
 	}
 
 	return &milspec.Value{
@@ -205,6 +219,87 @@ func createValue(dtype DType, shape []int64, data interface{}) *milspec.Value {
 			},
 		},
 	}
+}
+
+// addOpWithListArg adds an operation to the builder with support for list arguments.
+// listArgs maps parameter names to slices of Values (for operations like concat).
+func (b *Builder) addOpWithListArg(opType string, inputs map[string]*Value, listArgs map[string][]*Value, outputName string, outputDtype DType, outputShape []int64) *Value {
+	// Build input arguments
+	opInputs := make(map[string]*milspec.Argument)
+
+	// Handle regular scalar inputs
+	for name, v := range inputs {
+		if v.isConst {
+			// Constant value - embed the value directly
+			opInputs[name] = &milspec.Argument{
+				Arguments: []*milspec.Argument_Binding{{
+					Binding: &milspec.Argument_Binding_Value{Value: v.constVal},
+				}},
+			}
+		} else {
+			// Reference to another value
+			opInputs[name] = &milspec.Argument{
+				Arguments: []*milspec.Argument_Binding{{
+					Binding: &milspec.Argument_Binding_Name{Name: v.name},
+				}},
+			}
+		}
+	}
+
+	// Handle list arguments (for concat, etc.)
+	for name, values := range listArgs {
+		bindings := make([]*milspec.Argument_Binding, len(values))
+		for i, v := range values {
+			if v.isConst {
+				bindings[i] = &milspec.Argument_Binding{
+					Binding: &milspec.Argument_Binding_Value{Value: v.constVal},
+				}
+			} else {
+				bindings[i] = &milspec.Argument_Binding{
+					Binding: &milspec.Argument_Binding_Name{Name: v.name},
+				}
+			}
+		}
+		opInputs[name] = &milspec.Argument{
+			Arguments: bindings,
+		}
+	}
+
+	// Build output type
+	tensorType := &milspec.TensorType{
+		DataType:   outputDtype,
+		Rank:       int64(len(outputShape)),
+		Dimensions: make([]*milspec.Dimension, len(outputShape)),
+	}
+	for i, dim := range outputShape {
+		tensorType.Dimensions[i] = &milspec.Dimension{
+			Dimension: &milspec.Dimension_Constant{
+				Constant: &milspec.Dimension_ConstantDimension{Size: uint64(dim)},
+			},
+		}
+	}
+
+	op := &milspec.Operation{
+		Type:   opType,
+		Inputs: opInputs,
+		Outputs: []*milspec.NamedValueType{{
+			Name: outputName,
+			Type: &milspec.ValueType{
+				Type: &milspec.ValueType_TensorType{TensorType: tensorType},
+			},
+		}},
+	}
+
+	b.operations = append(b.operations, op)
+
+	v := &Value{
+		name:    outputName,
+		dtype:   outputDtype,
+		shape:   outputShape,
+		builder: b,
+	}
+	b.values[outputName] = v
+	return v
 }
 
 // addOp adds an operation to the builder and returns the output value.

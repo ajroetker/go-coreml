@@ -169,3 +169,46 @@ func TestBuilderConst(t *testing.T) {
 		t.Error("expected constant to be embedded as value")
 	}
 }
+
+func TestBuilderNormalization(t *testing.T) {
+	b := NewBuilder("norm_test")
+
+	// Create inputs
+	x := b.Input("x", Float32, 2, 3, 4, 4) // [N, C, H, W]
+	mean := b.Const("mean", Float32, []int64{3}, []float32{0.0, 0.0, 0.0})
+	variance := b.Const("variance", Float32, []int64{3}, []float32{1.0, 1.0, 1.0})
+	gamma := b.Const("gamma", Float32, []int64{3}, []float32{1.0, 1.0, 1.0})
+	beta := b.Const("beta", Float32, []int64{3}, []float32{0.0, 0.0, 0.0})
+
+	// Test BatchNorm
+	bn := b.BatchNorm(x, mean, variance, gamma, beta, 1e-5)
+	b.Output("bn_out", bn)
+
+	// Test LayerNorm
+	ln := b.LayerNorm(x, gamma, beta, []int64{1, 2, 3}, 1e-5)
+	b.Output("ln_out", ln)
+
+	// Test InstanceNorm
+	in := b.InstanceNorm(x, gamma, beta, 1e-5)
+	b.Output("in_out", in)
+
+	program := b.Build()
+
+	// Verify operations
+	mainFunc := program.Functions["norm_test"]
+	block := mainFunc.BlockSpecializations["CoreML7"]
+
+	// Count operation types
+	opTypeCount := make(map[string]int)
+	for _, op := range block.Operations {
+		opTypeCount[op.Type]++
+	}
+
+	// Check normalization ops are present
+	expectedOps := []string{"batch_norm", "layer_norm", "instance_norm"}
+	for _, exp := range expectedOps {
+		if opTypeCount[exp] < 1 {
+			t.Errorf("expected %s operation in program", exp)
+		}
+	}
+}
