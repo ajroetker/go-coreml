@@ -69,13 +69,14 @@ func New(opts ...Option) *Runtime {
 
 // Executable represents a compiled CoreML model ready for execution.
 type Executable struct {
-	model       *bridge.Model
-	inputNames  []string
-	outputNames []string
-	inputShapes [][]int64
+	model        *bridge.Model
+	inputNames   []string
+	outputNames  []string
+	inputShapes  [][]int64
 	outputShapes [][]int64
-	tempDir     string // For cleanup
-	mu          sync.Mutex
+	outputDTypes []model.DType
+	tempDir      string // For cleanup
+	mu           sync.Mutex
 }
 
 // Compile compiles a MIL program builder into an executable.
@@ -126,9 +127,11 @@ func (r *Runtime) CompileProgram(program *model.Program, inputs, outputs []model
 
 	outputNames := make([]string, len(outputs))
 	outputShapes := make([][]int64, len(outputs))
+	outputDTypes := make([]model.DType, len(outputs))
 	for i, out := range outputs {
 		outputNames[i] = out.Name
 		outputShapes[i] = out.Shape
+		outputDTypes[i] = out.DType
 	}
 
 	return &Executable{
@@ -137,6 +140,7 @@ func (r *Runtime) CompileProgram(program *model.Program, inputs, outputs []model
 		outputNames:  outputNames,
 		inputShapes:  inputShapes,
 		outputShapes: outputShapes,
+		outputDTypes: outputDTypes,
 		tempDir:      tempDir,
 	}, nil
 }
@@ -170,7 +174,8 @@ func (e *Executable) Run(inputs map[string]interface{}) (map[string]interface{},
 	// Create output tensors
 	outputTensors := make([]*bridge.Tensor, len(e.outputNames))
 	for i, shape := range e.outputShapes {
-		tensor, err := bridge.NewTensor(shape, bridge.DTypeFloat32)
+		bridgeDType := modelDTypeToBridge(e.outputDTypes[i])
+		tensor, err := bridge.NewTensor(shape, bridgeDType)
 		if err != nil {
 			// Clean up
 			for _, t := range inputTensors {
@@ -279,5 +284,21 @@ func extractTensorData(tensor *bridge.Tensor) (interface{}, error) {
 		return data, nil
 	default:
 		return nil, fmt.Errorf("unsupported dtype: %v", tensor.DType())
+	}
+}
+
+// modelDTypeToBridge converts model.DType to bridge.DType.
+func modelDTypeToBridge(dtype model.DType) bridge.DType {
+	switch dtype {
+	case model.Float32:
+		return bridge.DTypeFloat32
+	case model.Float16:
+		return bridge.DTypeFloat16
+	case model.Int32:
+		return bridge.DTypeInt32
+	case model.Bool:
+		return bridge.DTypeBool
+	default:
+		return bridge.DTypeFloat32 // Default fallback
 	}
 }

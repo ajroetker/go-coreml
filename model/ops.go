@@ -781,13 +781,22 @@ func (b *Builder) MaxPool(x *Value, kernelSize, strides []int64, padType ConvPad
 	}
 
 	// Add padding parameters based on type
+	// CoreML MIL requires "pad" parameter for pooling operations
 	switch padType {
 	case ConvPadValid:
 		padTypeVal := b.Const(b.genName("pad_type"), String, []int64{}, "valid")
 		inputs["pad_type"] = padTypeVal
+		// Still need to provide pad parameter with zeros
+		padSpec := make([]int32, 2*len(kernelSize))
+		padVal := b.Const(b.genName("pad"), Int32, []int64{int64(len(padSpec))}, padSpec)
+		inputs["pad"] = padVal
 	case ConvPadSame:
 		padTypeVal := b.Const(b.genName("pad_type"), String, []int64{}, "same")
 		inputs["pad_type"] = padTypeVal
+		// For same padding, CoreML calculates pad values automatically
+		padSpec := make([]int32, 2*len(kernelSize))
+		padVal := b.Const(b.genName("pad"), Int32, []int64{int64(len(padSpec))}, padSpec)
+		inputs["pad"] = padVal
 	case ConvPadCustom:
 		padTypeVal := b.Const(b.genName("pad_type"), String, []int64{}, "custom")
 		inputs["pad_type"] = padTypeVal
@@ -800,6 +809,10 @@ func (b *Builder) MaxPool(x *Value, kernelSize, strides []int64, padType ConvPad
 		padVal := b.Const(b.genName("pad"), Int32, []int64{int64(len(padSpec))}, padSpec)
 		inputs["pad"] = padVal
 	}
+
+	// ceil_mode is required by CoreML MIL
+	ceilModeVal := b.Const(b.genName("ceil_mode"), Bool, []int64{}, []bool{false})
+	inputs["ceil_mode"] = ceilModeVal
 
 	return b.addOp("max_pool", inputs, b.genName("max_pool"), x.dtype, outShape)
 }
@@ -851,9 +864,17 @@ func (b *Builder) AvgPool(x *Value, kernelSize, strides []int64, padType ConvPad
 	case ConvPadValid:
 		padTypeVal := b.Const(b.genName("pad_type"), String, []int64{}, "valid")
 		inputs["pad_type"] = padTypeVal
+		// Still need to provide pad parameter with zeros
+		padSpec := make([]int32, 2*len(kernelSize))
+		padVal := b.Const(b.genName("pad"), Int32, []int64{int64(len(padSpec))}, padSpec)
+		inputs["pad"] = padVal
 	case ConvPadSame:
 		padTypeVal := b.Const(b.genName("pad_type"), String, []int64{}, "same")
 		inputs["pad_type"] = padTypeVal
+		// Still need to provide pad parameter with zeros
+		padSpec := make([]int32, 2*len(kernelSize))
+		padVal := b.Const(b.genName("pad"), Int32, []int64{int64(len(padSpec))}, padSpec)
+		inputs["pad"] = padVal
 	case ConvPadCustom:
 		padTypeVal := b.Const(b.genName("pad_type"), String, []int64{}, "custom")
 		inputs["pad_type"] = padTypeVal
@@ -866,6 +887,10 @@ func (b *Builder) AvgPool(x *Value, kernelSize, strides []int64, padType ConvPad
 		padVal := b.Const(b.genName("pad"), Int32, []int64{int64(len(padSpec))}, padSpec)
 		inputs["pad"] = padVal
 	}
+
+	// ceil_mode is required by CoreML MIL
+	ceilModeVal := b.Const(b.genName("ceil_mode"), Bool, []int64{}, []bool{false})
+	inputs["ceil_mode"] = ceilModeVal
 
 	return b.addOp("avg_pool", inputs, b.genName("avg_pool"), x.dtype, outShape)
 }
@@ -980,6 +1005,129 @@ func (b *Builder) Reverse(x *Value, axes []int64) *Value {
 		"x":    x,
 		"axes": axesVal,
 	}, b.genName("reverse"), x.dtype, x.shape)
+}
+
+// Rsqrt computes element-wise reciprocal square root: z = 1/sqrt(x + epsilon).
+// epsilon: Small constant added for numerical stability (typically 1e-12).
+func (b *Builder) Rsqrt(x *Value) *Value {
+	epsilonVal := b.Const(b.genName("epsilon"), Float32, []int64{}, []float32{1e-12})
+
+	return b.addOp("rsqrt", map[string]*Value{
+		"x":       x,
+		"epsilon": epsilonVal,
+	}, b.genName("rsqrt"), x.dtype, x.shape)
+}
+
+// LogicalAnd performs element-wise logical AND: z = x && y.
+// Both inputs must have Bool dtype. Returns Bool dtype.
+func (b *Builder) LogicalAnd(x, y *Value) *Value {
+	outShape := broadcastShape(x.shape, y.shape)
+	return b.addOp("logical_and", map[string]*Value{
+		"x": x,
+		"y": y,
+	}, b.genName("logical_and"), Bool, outShape)
+}
+
+// LogicalOr performs element-wise logical OR: z = x || y.
+// Both inputs must have Bool dtype. Returns Bool dtype.
+func (b *Builder) LogicalOr(x, y *Value) *Value {
+	outShape := broadcastShape(x.shape, y.shape)
+	return b.addOp("logical_or", map[string]*Value{
+		"x": x,
+		"y": y,
+	}, b.genName("logical_or"), Bool, outShape)
+}
+
+// LogicalNot performs element-wise logical NOT: z = !x.
+// Input must have Bool dtype. Returns Bool dtype.
+func (b *Builder) LogicalNot(x *Value) *Value {
+	return b.addOp("logical_not", map[string]*Value{
+		"x": x,
+	}, b.genName("logical_not"), Bool, x.shape)
+}
+
+// LogicalXor performs element-wise logical XOR: z = x ^ y.
+// Both inputs must have Bool dtype. Returns Bool dtype.
+func (b *Builder) LogicalXor(x, y *Value) *Value {
+	outShape := broadcastShape(x.shape, y.shape)
+	return b.addOp("logical_xor", map[string]*Value{
+		"x": x,
+		"y": y,
+	}, b.genName("logical_xor"), Bool, outShape)
+}
+
+// IsNan checks element-wise if values are NaN.
+// Returns Bool dtype indicating which elements are NaN.
+func (b *Builder) IsNan(x *Value) *Value {
+	return b.addOp("isnan", map[string]*Value{
+		"x": x,
+	}, b.genName("isnan"), Bool, x.shape)
+}
+
+// IsFinite checks element-wise if values are finite (not NaN or Inf).
+// Returns Bool dtype indicating which elements are finite.
+func (b *Builder) IsFinite(x *Value) *Value {
+	return b.addOp("isfinite", map[string]*Value{
+		"x": x,
+	}, b.genName("isfinite"), Bool, x.shape)
+}
+
+// Range1D generates a 1D tensor of values from start to end (exclusive) with given step.
+// All parameters (start, end, step) are scalar values.
+// Returns a 1D tensor with dtype matching start.
+// Output size is ceil((end - start) / step).
+//
+// Note: This function can infer output size when all inputs are Int32 constants with scalar shape.
+func (b *Builder) Range1D(start, end, step *Value) *Value {
+	// Output is 1D, size depends on (end - start) / step
+	// Try to compute size if all inputs are Int32 scalar constants
+	var outputSize int64 = -1
+
+	if start.isConst && end.isConst && step.isConst && start.dtype == Int32 {
+		// Check if all are scalars (empty or single-element shape)
+		if (len(start.shape) == 0 || (len(start.shape) == 1 && start.shape[0] == 1)) &&
+			(len(end.shape) == 0 || (len(end.shape) == 1 && end.shape[0] == 1)) &&
+			(len(step.shape) == 0 || (len(step.shape) == 1 && step.shape[0] == 1)) {
+
+			// Extract values from the TensorValue immediate
+			if start.constVal != nil && end.constVal != nil && step.constVal != nil {
+				if startImm := start.constVal.GetImmediateValue(); startImm != nil {
+					if endImm := end.constVal.GetImmediateValue(); endImm != nil {
+						if stepImm := step.constVal.GetImmediateValue(); stepImm != nil {
+							if startTensor := startImm.GetTensor(); startTensor != nil {
+								if endTensor := endImm.GetTensor(); endTensor != nil {
+									if stepTensor := stepImm.GetTensor(); stepTensor != nil {
+										if startVals := startTensor.GetInts(); startVals != nil && len(startVals.Values) > 0 {
+											if endVals := endTensor.GetInts(); endVals != nil && len(endVals.Values) > 0 {
+												if stepVals := stepTensor.GetInts(); stepVals != nil && len(stepVals.Values) > 0 {
+													startVal := startVals.Values[0]
+													endVal := endVals.Values[0]
+													stepVal := stepVals.Values[0]
+													if stepVal > 0 && endVal > startVal {
+														outputSize = int64((endVal-startVal+stepVal-1) / stepVal)
+													} else if stepVal < 0 && endVal < startVal {
+														outputSize = int64((startVal-endVal-stepVal-1) / -stepVal)
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	outShape := []int64{outputSize}
+
+	return b.addOp("range_1d", map[string]*Value{
+		"start": start,
+		"end":   end,
+		"step":  step,
+	}, b.genName("range_1d"), start.dtype, outShape)
 }
 
 // Conv performs 2D convolution on input tensor x with filter weights.
@@ -1201,12 +1349,188 @@ func (b *Builder) Concat(values []*Value, axis int64) *Value {
 	// Create axis constant
 	axisVal := b.Const(b.genName("axis"), Int32, []int64{}, []int32{int32(axis)})
 
+	// Create interleave constant (default to false for standard concatenation)
+	interleaveVal := b.Const(b.genName("interleave"), Bool, []int64{}, []bool{false})
+
 	// Use addOpWithListArg to handle the list of values
 	return b.addOpWithListArg("concat",
-		map[string]*Value{"axis": axisVal}, // scalar inputs
+		map[string]*Value{
+			"axis":       axisVal,
+			"interleave": interleaveVal,
+		}, // scalar inputs
 		map[string][]*Value{"values": values}, // list inputs
 		b.genName("concat"),
 		dtype,
+		outShape)
+}
+
+// Clip clamps values to the range [minVal, maxVal].
+// x: Input tensor to clamp.
+// minVal: Minimum value (can be a tensor or scalar).
+// maxVal: Maximum value (can be a tensor or scalar).
+// Output: x clamped to [minVal, maxVal].
+func (b *Builder) Clip(x, minVal, maxVal *Value) *Value {
+	// Compute output shape based on broadcasting
+	outShape := broadcastShape(x.shape, minVal.shape)
+	outShape = broadcastShape(outShape, maxVal.shape)
+
+	return b.addOp("clip", map[string]*Value{
+		"x":   x,
+		"min": minVal,
+		"max": maxVal,
+	}, b.genName("clip"), x.dtype, outShape)
+}
+
+// Cast converts a tensor to a different dtype.
+// x: Input tensor to convert.
+// dtype: Target data type.
+// Output: x converted to dtype.
+func (b *Builder) Cast(x *Value, dtype DType) *Value {
+	return b.addOp("cast", map[string]*Value{
+		"x": x,
+	}, b.genName("cast"), dtype, x.shape)
+}
+
+// L2Norm computes L2 normalization along specified axes.
+// x: Input tensor.
+// axes: Axes along which to compute L2 norm. If nil or empty, normalizes over all axes.
+// epsilon: Small constant added to norm for numerical stability (typically 1e-12).
+// Output: x / (L2_norm(x, axes) + epsilon), same shape as input.
+func (b *Builder) L2Norm(x *Value, axes []int64, epsilon float32) *Value {
+	epsilonVal := b.Const(b.genName("epsilon"), Float32, []int64{}, []float32{epsilon})
+
+	inputs := map[string]*Value{
+		"x":       x,
+		"epsilon": epsilonVal,
+	}
+
+	if len(axes) > 0 {
+		axesVal := b.Const(b.genName("axes"), Int32, []int64{int64(len(axes))}, toInt32Slice(axes))
+		inputs["axes"] = axesVal
+	}
+
+	return b.addOp("l2_norm", inputs, b.genName("l2_norm"), x.dtype, x.shape)
+}
+
+// Linear performs a fused matrix multiplication and bias addition: y = x @ weight^T + bias.
+// This is more efficient than separate MatMul and Add operations.
+// x: Input tensor with shape [..., in_features].
+// weight: Weight matrix with shape [out_features, in_features].
+// bias: Bias vector with shape [out_features]. Can be nil for no bias.
+// Output: [..., out_features]
+func (b *Builder) Linear(x, weight, bias *Value) *Value {
+	// Compute output shape
+	// x: [..., in_features], weight: [out_features, in_features]
+	// output: [..., out_features]
+	xShape := x.shape
+	outFeatures := weight.shape[0]
+
+	outShape := make([]int64, len(xShape))
+	copy(outShape, xShape)
+	outShape[len(outShape)-1] = outFeatures
+
+	inputs := map[string]*Value{
+		"x":      x,
+		"weight": weight,
+	}
+
+	if bias != nil {
+		inputs["bias"] = bias
+	}
+
+	return b.addOp("linear", inputs, b.genName("linear"), x.dtype, outShape)
+}
+
+// SliceBySize extracts a sub-tensor using dynamic start indices and fixed sizes.
+// This is the MIL operation that supports dynamic start indices (runtime values).
+// x: Input tensor to slice.
+// begin: Start indices for each dimension (can be runtime values, shape [rank]).
+// size: Size of the slice for each dimension (must be constants).
+// Output shape: size (the slice dimensions).
+func (b *Builder) SliceBySize(x *Value, begin *Value, size []int64) *Value {
+	// Create size constant
+	sizeVal := b.Const(b.genName("size"), Int32, []int64{int64(len(size))}, toInt32Slice(size))
+
+	// Output shape is just the size parameter
+	outShape := make([]int64, len(size))
+	copy(outShape, size)
+
+	return b.addOp("slice_by_size", map[string]*Value{
+		"x":     x,
+		"begin": begin,
+		"size":  sizeVal,
+	}, b.genName("slice_by_size"), x.dtype, outShape)
+}
+
+// ScatterND scatters updates into a tensor using multi-dimensional indices.
+// This is a more general scatter operation that can update multiple dimensions.
+// data: Input tensor to update.
+// indices: Multi-dimensional indices [batch_dims..., index_depth].
+// updates: Values to scatter.
+// mode: Scatter mode ("update", "add", "sub", "mul", "div", "max", "min").
+// Output: Updated tensor with same shape as data.
+func (b *Builder) ScatterND(data, indices, updates *Value, mode string) *Value {
+	modeVal := b.Const(b.genName("mode"), String, []int64{}, mode)
+	// CoreML requires validate_indices parameter (typically set to false for performance)
+	validateIndicesVal := b.Const(b.genName("validate_indices"), Bool, []int64{}, []bool{false})
+
+	return b.addOp("scatter_nd", map[string]*Value{
+		"data":             data,
+		"indices":          indices,
+		"updates":          updates,
+		"mode":             modeVal,
+		"validate_indices": validateIndicesVal,
+	}, b.genName("scatter_nd"), data.dtype, data.shape)
+}
+
+// Einsum performs tensor multiplication using einsum notation.
+// This operation is available in CoreML MIL for iOS 15+.
+//
+// CoreML MIL einsum supports a limited set of equation patterns, specifically for
+// multiplying matrices on dimensions -1 and -3, treating other dimensions as batch.
+// Broadcasting is supported along batch dimensions.
+//
+// Supported equation patterns:
+//
+// Rank 4 inputs:
+//   - Equation: "nchw,nwhu->nchu" (and equivalent variations)
+//   - Input 1: [B, C, H, W1]
+//   - Input 2: [B, W1, H, W2]
+//   - Output:  [B, C, H, W2]
+//   - Broadcasting: If B or H is 1 in one input, it broadcasts to match the other
+//
+// Rank 3 inputs:
+//   - Equation: "chw,whr->chr" (and equivalent variations)
+//   - Input 1: [C, H, W1]
+//   - Input 2: [W1, H, W2]
+//   - Output:  [C, H, W2]
+//   - Broadcasting: If H is 1 in one input, it broadcasts to match the other
+//
+// equation: Einstein summation notation string (e.g., "nchw,nwhu->nchu")
+// values: Tuple of two input tensors (rank 3 or 4)
+//
+// Returns: Result tensor with shape determined by the equation
+func (b *Builder) Einsum(equation string, values []*Value) *Value {
+	if len(values) != 2 {
+		panic("einsum requires exactly 2 input tensors")
+	}
+
+	x := values[0]
+	y := values[1]
+
+	// Compute output shape based on equation and input shapes
+	// For the supported patterns, the output has the same rank as inputs
+	outShape := computeEinsumOutputShape(equation, x.shape, y.shape)
+
+	// Create equation constant
+	equationVal := b.Const(b.genName("equation"), String, []int64{}, equation)
+
+	// Use addOpWithListArg to handle the list of values
+	return b.addOpWithListArg("einsum",
+		map[string]*Value{"equation": equationVal}, // scalar inputs
+		map[string][]*Value{"values": values},      // list inputs
+		b.genName("einsum"),
+		x.dtype,
 		outShape)
 }
 
@@ -1287,4 +1611,63 @@ func computeReduceShape(shape []int64, axes []int64, keepDims bool) []int64 {
 		return []int64{} // Scalar
 	}
 	return result
+}
+
+// computeEinsumOutputShape computes the output shape for einsum operation.
+// CoreML MIL einsum supports limited patterns for batched matrix multiplication.
+// This function handles the supported patterns and computes the output shape.
+func computeEinsumOutputShape(equation string, xShape, yShape []int64) []int64 {
+	// For the supported CoreML patterns, the output shape follows this logic:
+	// Rank 4: [B, C, H, W1] x [B, W1, H, W2] -> [B, C, H, W2]
+	// Rank 3: [C, H, W1] x [W1, H, W2] -> [C, H, W2]
+	//
+	// The general pattern is:
+	// - Batch dimensions (if present) are preserved with broadcasting
+	// - First input contributes dimension at position 1 (C)
+	// - Both inputs share dimension at position -2 (H)
+	// - Last dimension of output comes from second input (W2)
+
+	rank := len(xShape)
+	outShape := make([]int64, rank)
+
+	if rank == 4 {
+		// Rank 4: [B, C, H, W1] x [B, W1, H, W2] -> [B, C, H, W2]
+		// Broadcast batch dimension
+		if xShape[0] == 1 {
+			outShape[0] = yShape[0]
+		} else {
+			outShape[0] = xShape[0]
+		}
+		// C from first input
+		outShape[1] = xShape[1]
+		// H with broadcasting
+		if xShape[2] == 1 {
+			outShape[2] = yShape[2]
+		} else {
+			outShape[2] = xShape[2]
+		}
+		// W2 from second input
+		outShape[3] = yShape[3]
+	} else if rank == 3 {
+		// Rank 3: [C, H, W1] x [W1, H, W2] -> [C, H, W2]
+		// C from first input
+		outShape[0] = xShape[0]
+		// H with broadcasting
+		if xShape[1] == 1 {
+			outShape[1] = yShape[1]
+		} else {
+			outShape[1] = xShape[1]
+		}
+		// W2 from second input
+		outShape[2] = yShape[2]
+	} else {
+		// Unsupported rank - return -1 to indicate unknown shape
+		// This will be caught at runtime when CoreML validates the operation
+		outShape = make([]int64, rank)
+		for i := range outShape {
+			outShape[i] = -1
+		}
+	}
+
+	return outShape
 }

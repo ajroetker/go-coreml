@@ -266,14 +266,29 @@ func (m *Model) Predict(inputNames []string, inputs []*Tensor, outputNames []str
 		cOutputs[i] = t.handle
 	}
 
+	// Handle empty inputs/outputs by using nil pointers
+	var cInputNamesPtr **C.char
+	var cInputsPtr *C.CoreMLTensor
+	if len(inputs) > 0 {
+		cInputNamesPtr = (**C.char)(unsafe.Pointer(&cInputNames[0]))
+		cInputsPtr = (*C.CoreMLTensor)(unsafe.Pointer(&cInputs[0]))
+	}
+
+	var cOutputNamesPtr **C.char
+	var cOutputsPtr *C.CoreMLTensor
+	if len(outputs) > 0 {
+		cOutputNamesPtr = (**C.char)(unsafe.Pointer(&cOutputNames[0]))
+		cOutputsPtr = (*C.CoreMLTensor)(unsafe.Pointer(&cOutputs[0]))
+	}
+
 	var err C.CoreMLError
 	ok := C.coreml_model_predict(
 		m.handle,
-		(**C.char)(unsafe.Pointer(&cInputNames[0])),
-		(*C.CoreMLTensor)(unsafe.Pointer(&cInputs[0])),
+		cInputNamesPtr,
+		cInputsPtr,
 		C.int(len(inputs)),
-		(**C.char)(unsafe.Pointer(&cOutputNames[0])),
-		(*C.CoreMLTensor)(unsafe.Pointer(&cOutputs[0])),
+		cOutputNamesPtr,
+		cOutputsPtr,
 		C.int(len(outputs)),
 		&err,
 	)

@@ -13,8 +13,8 @@ import (
 )
 
 // SpecVersion is the CoreML specification version.
-// Version 8 supports ML Programs (MIL).
-const SpecVersion = 8
+// Version 9 supports ML Programs (MIL) with empty inputs (macOS 14+, iOS 17+).
+const SpecVersion = 9
 
 // SerializeOptions configures model serialization.
 type SerializeOptions struct {
