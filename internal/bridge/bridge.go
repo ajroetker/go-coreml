@@ -5,8 +5,8 @@
 package bridge
 
 /*
-#cgo CFLAGS: -x objective-c
-#cgo LDFLAGS: -framework Foundation -framework CoreML
+#cgo darwin CFLAGS: -fobjc-arc
+#cgo darwin LDFLAGS: -framework Foundation -framework CoreML
 #include "bridge.h"
 #include <stdlib.h>
 */
@@ -45,6 +45,35 @@ func SetComputeUnits(units ComputeUnits) {
 // Model represents a loaded CoreML model.
 type Model struct {
 	handle C.CoreMLModel
+}
+
+// CompileModel compiles an .mlpackage to .mlmodelc using CoreML.
+// Returns the path to the compiled model.
+// If outputDir is empty, the model is compiled to a temporary location.
+func CompileModel(packagePath, outputDir string) (string, error) {
+	cPackagePath := C.CString(packagePath)
+	defer C.free(unsafe.Pointer(cPackagePath))
+
+	var cOutputDir *C.char
+	if outputDir != "" {
+		cOutputDir = C.CString(outputDir)
+		defer C.free(unsafe.Pointer(cOutputDir))
+	}
+
+	var err C.CoreMLError
+	compiledPath := C.coreml_compile_model(cPackagePath, cOutputDir, &err)
+	if compiledPath == nil {
+		msg := "unknown error"
+		if err.message != nil {
+			msg = C.GoString(err.message)
+			C.free(unsafe.Pointer(err.message))
+		}
+		return "", fmt.Errorf("failed to compile model: %s", msg)
+	}
+
+	result := C.GoString(compiledPath)
+	C.free(unsafe.Pointer(compiledPath))
+	return result, nil
 }
 
 // LoadModel loads a CoreML model from a .mlmodelc directory.

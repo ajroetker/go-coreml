@@ -21,6 +21,10 @@ typedef struct {
     const char* message;
 } CoreMLError;
 
+// Model compilation (mlpackage -> mlmodelc)
+// Returns path to compiled model, caller must free with free()
+char* coreml_compile_model(const char* package_path, const char* output_dir, CoreMLError* error);
+
 // Model loading
 CoreMLModel coreml_load_model(const char* path, CoreMLError* error);
 void coreml_free_model(CoreMLModel model);

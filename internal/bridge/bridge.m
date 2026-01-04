@@ -37,6 +37,45 @@ static void set_error(CoreMLError* error, int code, NSError* nsError) {
     }
 }
 
+char* coreml_compile_model(const char* package_path, const char* output_dir, CoreMLError* error) {
+    @autoreleasepool {
+        NSString* nsPackagePath = [NSString stringWithUTF8String:package_path];
+        NSURL* packageURL = [NSURL fileURLWithPath:nsPackagePath];
+
+        NSError* nsError = nil;
+
+        // Compile the model using MLModel.compileModel(at:)
+        NSURL* compiledURL = [MLModel compileModelAtURL:packageURL error:&nsError];
+        if (compiledURL == nil) {
+            set_error(error, 1, nsError);
+            return NULL;
+        }
+
+        // If output_dir is specified, move the compiled model there
+        if (output_dir != NULL && strlen(output_dir) > 0) {
+            NSString* nsOutputDir = [NSString stringWithUTF8String:output_dir];
+            NSString* destPath = [nsOutputDir stringByAppendingPathComponent:[compiledURL lastPathComponent]];
+            NSURL* destURL = [NSURL fileURLWithPath:destPath];
+
+            NSFileManager* fm = [NSFileManager defaultManager];
+
+            // Remove existing if any
+            [fm removeItemAtURL:destURL error:nil];
+
+            // Move compiled model to destination
+            if (![fm moveItemAtURL:compiledURL toURL:destURL error:&nsError]) {
+                set_error(error, 2, nsError);
+                return NULL;
+            }
+
+            return strdup([destPath UTF8String]);
+        }
+
+        // Return the temporary compiled path
+        return strdup([[compiledURL path] UTF8String]);
+    }
+}
+
 CoreMLModel coreml_load_model(const char* path, CoreMLError* error) {
     @autoreleasepool {
         NSString* nsPath = [NSString stringWithUTF8String:path];
