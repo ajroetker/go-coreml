@@ -1,5 +1,7 @@
 package model
 
+import "fmt"
+
 // This file contains MIL operation builders.
 // MIL operations are documented at:
 // https://apple.github.io/coremltools/docs-guides/source/ops-reference.html
@@ -1320,9 +1322,11 @@ func (b *Builder) ConvWithBias(x, weight, bias *Value, strides, dilations []int6
 // values: List of tensors to concatenate. All must have the same shape except along the concat axis.
 // axis: Axis along which to concatenate. Must be in range [-rank, rank).
 // Output shape: same as input shapes, except dimension along axis is the sum of input dimensions.
+// Returns nil and sets builder error if called with no inputs.
 func (b *Builder) Concat(values []*Value, axis int64) *Value {
 	if len(values) == 0 {
-		panic("concat requires at least one input tensor")
+		b.setErr(fmt.Errorf("concat requires at least one input tensor"))
+		return nil
 	}
 
 	// Get first tensor's properties
@@ -1537,10 +1541,12 @@ func (b *Builder) ScatterND(data, indices, updates *Value, mode string) *Value {
 // equation: Einstein summation notation string (e.g., "nchw,nwhu->nchu")
 // values: Tuple of two input tensors (rank 3 or 4)
 //
-// Returns: Result tensor with shape determined by the equation
+// Returns: Result tensor with shape determined by the equation.
+// Returns nil and sets builder error if not given exactly 2 inputs.
 func (b *Builder) Einsum(equation string, values []*Value) *Value {
 	if len(values) != 2 {
-		panic("einsum requires exactly 2 input tensors")
+		b.setErr(fmt.Errorf("einsum requires exactly 2 input tensors, got %d", len(values)))
+		return nil
 	}
 
 	x := values[0]

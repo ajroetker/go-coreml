@@ -93,9 +93,10 @@ func copyFlat(flatDst, flatSrc any) {
 }
 
 // cloneBuffer using the pool to allocate a new one.
-func (b *Backend) cloneBuffer(buffer *Buffer) *Buffer {
+// Returns an error if the buffer is nil or has already been finalized.
+func (b *Backend) cloneBuffer(buffer *Buffer) (*Buffer, error) {
 	if buffer == nil || buffer.flat == nil || !buffer.shape.Ok() || !buffer.valid {
-		// the buffer is already empty.
+		// the buffer is already empty or finalized.
 		var issues []string
 		if buffer != nil {
 			if buffer.flat == nil {
@@ -110,12 +111,12 @@ func (b *Backend) cloneBuffer(buffer *Buffer) *Buffer {
 		} else {
 			issues = append(issues, "buffer was nil")
 		}
-		panic(errors.Errorf("cloneBuffer(%p): %s -- buffer was already finalized!?\n", buffer, strings.Join(issues, ", ")))
+		return nil, errors.Errorf("cloneBuffer(%p): %s -- buffer was already finalized", buffer, strings.Join(issues, ", "))
 	}
 	newBuffer := b.getBuffer(buffer.shape.DType, buffer.shape.Size())
 	newBuffer.shape = buffer.shape.Clone()
 	copyFlat(newBuffer.flat, buffer.flat)
-	return newBuffer
+	return newBuffer, nil
 }
 
 // NewBuffer creates the buffer with a newly allocated flat space.

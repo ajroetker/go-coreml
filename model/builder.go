@@ -71,6 +71,21 @@ type Builder struct {
 	operations []*milspec.Operation
 	values     map[string]*Value
 	nextID     int
+	err        error // first error encountered during building
+}
+
+// Err returns the first error encountered during building, if any.
+// Callers should check this after constructing a graph to ensure
+// all operations were valid.
+func (b *Builder) Err() error {
+	return b.err
+}
+
+// setErr records the first error encountered.
+func (b *Builder) setErr(err error) {
+	if b.err == nil {
+		b.err = err
+	}
 }
 
 // NewBuilder creates a new MIL program builder.

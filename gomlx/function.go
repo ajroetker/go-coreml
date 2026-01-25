@@ -904,17 +904,41 @@ func (f *Function) Sort(comparator backends.Function, axis int, isStable bool, i
 }
 
 // While executes a loop while a condition is true.
+//
+// Note: CoreML MIL does support while_loop operations at the spec level via nested blocks,
+// but the go-coreml implementation does not yet support building control flow operations.
+// See https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html
+// for CoreML MIL control flow documentation.
+//
+// Workarounds:
+//   - Unroll the loop at graph construction time if the iteration count is known
+//   - Use a different backend (e.g., XLA) for models that require dynamic loops
+//   - Refactor the computation to avoid loops where possible
 func (f *Function) While(cond, body backends.Function, initialState ...backends.Value) ([]backends.Value, error) {
 	return nil, errors.Wrapf(
 		notimplemented.NotImplementedError,
-		"While not yet supported for %q builder", BackendName)
+		"While loops are not yet implemented in the go-coreml library. "+
+			"CoreML MIL supports while_loop via nested blocks, but go-coreml has not implemented this feature. "+
+			"Consider unrolling the loop if the iteration count is known, or use a different backend for %q", BackendName)
 }
 
 // If executes one of two branches based on a boolean predicate.
+//
+// Note: CoreML MIL does support conditional (cond) operations at the spec level via nested blocks,
+// but the go-coreml implementation does not yet support building control flow operations.
+// See https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html
+// for CoreML MIL control flow documentation.
+//
+// Workarounds:
+//   - Use Where() for element-wise conditional selection (already supported)
+//   - Compute both branches and use Where() to select results based on condition
+//   - Use a different backend (e.g., XLA) for models that require dynamic conditionals
 func (f *Function) If(pred backends.Value, trueBranch, falseBranch backends.Function) ([]backends.Value, error) {
 	return nil, errors.Wrapf(
 		notimplemented.NotImplementedError,
-		"If not yet supported for %q builder", BackendName)
+		"If conditionals are not yet implemented in the go-coreml library. "+
+			"CoreML MIL supports cond via nested blocks, but go-coreml has not implemented this feature. "+
+			"Consider using Where() for element-wise selection, or use a different backend for %q", BackendName)
 }
 
 // Where selects elements from onTrue or onFalse based on the condition.
@@ -2045,9 +2069,27 @@ func (f *Function) ReduceWindow(
 		resultValue = f.builder.milBuilder.Mul(avgResult, windowSizeConst)
 
 	case backends.ReduceOpMin:
-		// CoreML doesn't have MinPool directly
-		// TODO: Implement MinPool via negation: -MaxPool(-x)
-		return nil, errors.Errorf("ReduceWindow: ReduceOpMin is not directly supported by CoreML backend")
+		// CoreML doesn't have MinPool directly, so we use the negation trick:
+		// MinPool(x) = -MaxPool(-x)
+
+		// Step 1: Negate the input
+		negOneConstName := fmt.Sprintf("minpool_neg_one_%d", f.builder.nextConstID)
+		f.builder.nextConstID++
+		negOne := f.builder.milBuilder.Const(negOneConstName, operand.milValue.DType(), []int64{}, []float32{-1.0})
+		negInput := f.builder.milBuilder.Mul(operand.milValue, negOne)
+
+		// Step 2: Apply MaxPool to the negated input
+		maxPoolResult := f.builder.milBuilder.MaxPool(
+			negInput,
+			milKernelSize,
+			milStrides,
+			padType,
+			padBefore,
+			padAfter,
+		)
+
+		// Step 3: Negate the result to get MinPool
+		resultValue = f.builder.milBuilder.Mul(maxPoolResult, negOne)
 
 	case backends.ReduceOpProduct:
 		// CoreML doesn't have ProductPool

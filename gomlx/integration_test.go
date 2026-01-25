@@ -630,3 +630,181 @@ func TestReduceWindowSumPool(t *testing.T) {
 		}
 	}
 }
+
+// TestReduceWindowMinPool tests ReduceWindow with MinPool semantics.
+// MinPool is implemented via the negation trick: MinPool(x) = -MaxPool(-x)
+func TestReduceWindowMinPool(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("reduce_window_min_pool")
+	mainFn := builder.Main()
+
+	// Input shape: [1, 1, 4, 4] (batch=1, channels=1, height=4, width=4)
+	inputShape := shapes.Make(dtypes.Float32, 1, 1, 4, 4)
+
+	input, err := mainFn.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for input failed: %v", err)
+	}
+
+	// MinPool with 2x2 window, stride 2
+	// Window dimensions: [1, 1, 2, 2] (batch=1, channels=1, spatial=2x2)
+	// Strides: [1, 1, 2, 2]
+	result, err := mainFn.ReduceWindow(
+		input,
+		backends.ReduceOpMin,
+		[]int{1, 1, 2, 2}, // windowDimensions
+		[]int{1, 1, 2, 2}, // strides
+		nil,               // baseDilations
+		nil,               // windowDilations
+		nil,               // paddings
+	)
+	if err != nil {
+		t.Fatalf("ReduceWindow() failed: %v", err)
+	}
+
+	// Set output
+	if err := mainFn.Return([]backends.Value{result}, nil); err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	// Compile
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Create input buffer
+	inputData := []float32{
+		1, 2, 3, 4,
+		5, 6, 7, 8,
+		9, 10, 11, 12,
+		13, 14, 15, 16,
+	}
+
+	inputBuffer, err := backend.BufferFromFlatData(0, inputData, inputShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() failed: %v", err)
+	}
+
+	// Execute
+	outputs, err := exec.Execute([]backends.Buffer{inputBuffer}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+	if len(outputs) != 1 {
+		t.Fatalf("Expected 1 output, got %d", len(outputs))
+	}
+
+	// Expected shape: [1, 1, 2, 2] (4x4 input with 2x2 window and stride 2)
+	expectedShape := shapes.Make(dtypes.Float32, 1, 1, 2, 2)
+	outputData := make([]float32, expectedShape.Size())
+	if err := backend.BufferToFlatData(outputs[0], outputData); err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	// Expected values: min of each 2x2 window
+	// Window 1: min(1,2,5,6) = 1
+	// Window 2: min(3,4,7,8) = 3
+	// Window 3: min(9,10,13,14) = 9
+	// Window 4: min(11,12,15,16) = 11
+	expected := []float32{1, 3, 9, 11}
+	for i, v := range expected {
+		if len(outputData) > i && math.Abs(float64(outputData[i]-v)) > 0.01 {
+			t.Errorf("Expected output[%d] = %f, got %f", i, v, outputData[i])
+		}
+	}
+}
+
+// TestReduceWindowMinPoolNegativeValues tests MinPool with negative values
+// to verify the negation trick works correctly.
+func TestReduceWindowMinPoolNegativeValues(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("reduce_window_min_pool_neg")
+	mainFn := builder.Main()
+
+	// Input shape: [1, 1, 4, 4] (batch=1, channels=1, height=4, width=4)
+	inputShape := shapes.Make(dtypes.Float32, 1, 1, 4, 4)
+
+	input, err := mainFn.Parameter("input", inputShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for input failed: %v", err)
+	}
+
+	// MinPool with 2x2 window, stride 2
+	result, err := mainFn.ReduceWindow(
+		input,
+		backends.ReduceOpMin,
+		[]int{1, 1, 2, 2}, // windowDimensions
+		[]int{1, 1, 2, 2}, // strides
+		nil,               // baseDilations
+		nil,               // windowDilations
+		nil,               // paddings
+	)
+	if err != nil {
+		t.Fatalf("ReduceWindow() failed: %v", err)
+	}
+
+	// Set output
+	if err := mainFn.Return([]backends.Value{result}, nil); err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	// Compile
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Create input buffer with negative values
+	inputData := []float32{
+		-5, -2, -3, -4,
+		-1, -6, -7, -8,
+		-9, -10, -11, -12,
+		-13, -14, -15, -16,
+	}
+
+	inputBuffer, err := backend.BufferFromFlatData(0, inputData, inputShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() failed: %v", err)
+	}
+
+	// Execute
+	outputs, err := exec.Execute([]backends.Buffer{inputBuffer}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+	if len(outputs) != 1 {
+		t.Fatalf("Expected 1 output, got %d", len(outputs))
+	}
+
+	// Expected shape: [1, 1, 2, 2]
+	expectedShape := shapes.Make(dtypes.Float32, 1, 1, 2, 2)
+	outputData := make([]float32, expectedShape.Size())
+	if err := backend.BufferToFlatData(outputs[0], outputData); err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	// Expected values: min of each 2x2 window
+	// Window 1: min(-5,-2,-1,-6) = -6
+	// Window 2: min(-3,-4,-7,-8) = -8
+	// Window 3: min(-9,-10,-13,-14) = -14
+	// Window 4: min(-11,-12,-15,-16) = -16
+	expected := []float32{-6, -8, -14, -16}
+	for i, v := range expected {
+		if len(outputData) > i && math.Abs(float64(outputData[i]-v)) > 0.01 {
+			t.Errorf("Expected output[%d] = %f, got %f", i, v, outputData[i])
+		}
+	}
+}
