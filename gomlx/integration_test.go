@@ -287,9 +287,84 @@ func TestBatchedMatMul(t *testing.T) {
 }
 
 // TestDotGeneralVectorDot tests DotGeneral with vector dot product (inner product).
-// SKIPPED: CoreML runtime currently has issues with scalar output tensors.
 func TestDotGeneralVectorDot(t *testing.T) {
-	t.Skip("CoreML runtime does not support scalar output tensors yet (go-coreml issue)")
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("vector_dot")
+	mainFn := builder.Main()
+
+	// Vector dot product: [4] dot [4] -> scalar
+	vecShape := shapes.Make(dtypes.Float32, 4)
+
+	a, err := mainFn.Parameter("a", vecShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for a failed: %v", err)
+	}
+
+	b, err := mainFn.Parameter("b", vecShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter() for b failed: %v", err)
+	}
+
+	// Dot product: a · b = sum(a[i] * b[i])
+	// DotGeneral with contracting axis 0 on both sides
+	result, err := mainFn.DotGeneral(a, []int{0}, nil, b, []int{0}, nil)
+	if err != nil {
+		t.Fatalf("DotGeneral() failed: %v", err)
+	}
+
+	// Return scalar result
+	if err := mainFn.Return([]backends.Value{result}, nil); err != nil {
+		t.Fatalf("Return() failed: %v", err)
+	}
+
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile() failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Test data: a = [1, 2, 3, 4], b = [2, 3, 4, 5]
+	// Expected: 1*2 + 2*3 + 3*4 + 4*5 = 2 + 6 + 12 + 20 = 40
+	aData := []float32{1, 2, 3, 4}
+	bData := []float32{2, 3, 4, 5}
+
+	aBuf, err := backend.BufferFromFlatData(0, aData, vecShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for a failed: %v", err)
+	}
+	defer backend.BufferFinalize(aBuf)
+
+	bBuf, err := backend.BufferFromFlatData(0, bData, vecShape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData() for b failed: %v", err)
+	}
+	defer backend.BufferFinalize(bBuf)
+
+	outputs, err := exec.Execute([]backends.Buffer{aBuf, bBuf}, nil, 0)
+	if err != nil {
+		t.Fatalf("Execute() failed: %v", err)
+	}
+
+	if len(outputs) != 1 {
+		t.Fatalf("Expected 1 output, got %d", len(outputs))
+	}
+
+	// Get scalar output
+	outputData := make([]float32, 1)
+	if err := backend.BufferToFlatData(outputs[0], outputData); err != nil {
+		t.Fatalf("BufferToFlatData() failed: %v", err)
+	}
+
+	expected := float32(40.0)
+	if outputData[0] != expected {
+		t.Errorf("Expected %f, got %f", expected, outputData[0])
+	}
+	t.Logf("Vector dot product result: %f (expected %f)", outputData[0], expected)
 }
 
 // TestAttentionBlock tests a simplified self-attention mechanism.

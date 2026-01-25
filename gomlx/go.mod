@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/gomlx/go-coreml v0.0.0-20260109045350-0b720b1b4a65
-	github.com/gomlx/gomlx v0.26.1-0.20260114055508-add9ba1579a4
+	github.com/gomlx/gomlx v0.26.1-0.20260121051322-dbf0e3293e25
 	github.com/pkg/errors v0.9.1
 )
 

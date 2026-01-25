@@ -141,10 +141,15 @@ type Tensor struct {
 }
 
 // NewTensor creates a new tensor with the given shape and data type.
+// An empty shape creates a scalar (rank-0) tensor.
 func NewTensor(shape []int64, dtype DType) (*Tensor, error) {
 	var err C.CoreMLError
+	var shapePtr *C.int64_t
+	if len(shape) > 0 {
+		shapePtr = (*C.int64_t)(unsafe.Pointer(&shape[0]))
+	}
 	handle := C.coreml_tensor_create(
-		(*C.int64_t)(unsafe.Pointer(&shape[0])),
+		shapePtr,
 		C.int(len(shape)),
 		C.int(dtype),
 		&err,
@@ -161,10 +166,15 @@ func NewTensor(shape []int64, dtype DType) (*Tensor, error) {
 }
 
 // NewTensorWithData creates a tensor and copies data into it.
+// An empty shape creates a scalar (rank-0) tensor.
 func NewTensorWithData(shape []int64, dtype DType, data unsafe.Pointer) (*Tensor, error) {
 	var err C.CoreMLError
+	var shapePtr *C.int64_t
+	if len(shape) > 0 {
+		shapePtr = (*C.int64_t)(unsafe.Pointer(&shape[0]))
+	}
 	handle := C.coreml_tensor_create_with_data(
-		(*C.int64_t)(unsafe.Pointer(&shape[0])),
+		shapePtr,
 		C.int(len(shape)),
 		C.int(dtype),
 		data,
