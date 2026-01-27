@@ -95,9 +95,13 @@ func (r *Runtime) CompileProgram(program *model.Program, inputs, outputs []model
 	// Convert program to CoreML model
 	coremlModel := model.ToModel(program, inputs, outputs, model.DefaultOptions())
 
-	// Save as mlpackage
+	// Save as mlpackage with blob storage for large constants.
+	// This is critical for performance when model weights are embedded as constants
+	// (via PreferConstantsForVariables capability) - blob storage enables memory-mapping
+	// of large weight tensors instead of loading them inline from protobuf.
 	packagePath := filepath.Join(tempDir, "model.mlpackage")
-	if err := model.SaveMLPackage(coremlModel, packagePath); err != nil {
+	blobOpts := model.DefaultBlobOptions()
+	if err := model.SaveMLPackageWithBlobs(coremlModel, packagePath, blobOpts); err != nil {
 		os.RemoveAll(tempDir)
 		return nil, fmt.Errorf("save mlpackage: %w", err)
 	}
