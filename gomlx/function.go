@@ -84,6 +84,46 @@ func (f *Function) Closure() (backends.Function, error) {
 	return closure, nil
 }
 
+// sanitizeName converts a name to a valid CoreML identifier.
+// CoreML identifiers must match: [A-Za-z\_][A-Za-z0-9\_@]*
+// This function replaces invalid characters with underscores and ensures
+// the name starts with a letter or underscore.
+func sanitizeName(name string) string {
+	if name == "" {
+		return "_empty_"
+	}
+
+	result := make([]byte, 0, len(name))
+	for i, c := range name {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '@' {
+			result = append(result, byte(c))
+		} else if c >= '0' && c <= '9' {
+			if i == 0 {
+				// Can't start with a digit, prepend underscore
+				result = append(result, '_')
+			}
+			result = append(result, byte(c))
+		} else {
+			// Replace invalid character with underscore
+			result = append(result, '_')
+		}
+	}
+
+	// Ensure we have at least one character
+	if len(result) == 0 {
+		return "_sanitized_"
+	}
+
+	// Ensure first character is valid (letter or underscore)
+	if result[0] != '_' && result[0] != '@' &&
+		!(result[0] >= 'A' && result[0] <= 'Z') &&
+		!(result[0] >= 'a' && result[0] <= 'z') {
+		result = append([]byte{'_'}, result...)
+	}
+
+	return string(result)
+}
+
 // Parameter creates an input parameter for this function.
 func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends.ShardingSpec) (backends.Value, error) {
 	if err := f.CheckValid(); err != nil {
@@ -103,6 +143,9 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 			notimplemented.NotImplementedError,
 			"sharding spec %+v not supported for %q builder", sharding, BackendName)
 	}
+
+	// Sanitize the name to be a valid CoreML identifier
+	sanitizedName := sanitizeName(name)
 
 	// Convert GoMLX dtype to CoreML dtype
 	milDType, err := gomlxDTypeToMIL(shape.DType)
@@ -126,7 +169,7 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 		// For closures, create a placeholder value that is NOT added as a model input.
 		// The actual block input will be created during replayClosureInBlock.
 		// We use a unique name to avoid conflicts.
-		closureParamName := fmt.Sprintf("closure_%p_param_%s", f, name)
+		closureParamName := fmt.Sprintf("closure_%p_param_%s", f, sanitizedName)
 		milValue = f.builder.milBuilder.PlaceholderValue(closureParamName, milDType, dims...)
 		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
 		f.builder.nodeMap[node] = milValue
@@ -135,13 +178,14 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 		// because closure parameters are not model-level inputs
 	} else {
 		// For the main function, create a proper model input
-		milValue = f.builder.milBuilder.Input(name, milDType, dims...)
+		// Use sanitized name for CoreML compatibility
+		milValue = f.builder.milBuilder.Input(sanitizedName, milDType, dims...)
 		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
 		f.builder.inputs = append(f.builder.inputs, node)
 		f.builder.nodeMap[node] = milValue
 		f.parameters = append(f.parameters, node)
-		// Track input metadata for model-level inputs only
-		f.builder.inputNames = append(f.builder.inputNames, name)
+		// Track input metadata for model-level inputs only (use sanitized name)
+		f.builder.inputNames = append(f.builder.inputNames, sanitizedName)
 		f.builder.inputShapes = append(f.builder.inputShapes, shape)
 	}
 
@@ -176,10 +220,22 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 		)
 	}
 
-	// Convert to MIL dtype
+	// Convert to MIL dtype (note: Int64 maps to Int32 for CoreML compatibility)
 	milDType, err := gomlxDTypeToMIL(dtype)
 	if err != nil {
 		return nil, errors.Wrap(err, "Constant")
+	}
+
+	// If the GoMLX dtype is Int64 but MIL dtype is Int32, convert the data.
+	// This keeps the GoMLX shape as Int64 (for onnx-gomlx compatibility) while
+	// giving CoreML Int32 data (which it supports).
+	milData := flat
+	if dtype == dtypes.Int64 && milDType == model.Int32 {
+		int64Data := flat.([]int64)
+		if !int64SliceFitsInInt32(int64Data) {
+			return nil, errors.Errorf("Constant: Int64 values exceed Int32 range, cannot convert for CoreML")
+		}
+		milData = convertInt64ToInt32(int64Data)
 	}
 
 	// Convert dimensions to int64
@@ -193,7 +249,7 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	f.builder.nextConstID++
 
 	// Create constant in MIL builder
-	milValue := f.builder.milBuilder.Const(constName, milDType, milShape, flat)
+	milValue := f.builder.milBuilder.Const(constName, milDType, milShape, milData)
 
 	// Create node
 	node := f.builder.newNode(backends.OpTypeConstant, shape, milValue)
@@ -376,8 +432,24 @@ func (f *Function) addBinaryOp(
 	}
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
+	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
+	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
+	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	lhsValue := lhsNode.milValue
+	rhsValue := rhsNode.milValue
+	lhsShape := lhsNode.shape
+	rhsShape := rhsNode.shape
+
+	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
+		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
+		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
+	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
+		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
+		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
+	}
+
 	// Compute output shape using shapeinference
-	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	outputShape, err := shapeinference.BinaryOp(opType, lhsShape, rhsShape)
 	if err != nil {
 		return nil, err
 	}
@@ -395,8 +467,6 @@ func (f *Function) addBinaryOp(
 		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, milDType, milShape...)
 	} else {
 		// In main function context, build the MIL operation directly.
-		lhsValue := lhsNode.milValue
-		rhsValue := rhsNode.milValue
 		resultValue = milOp(lhsValue, rhsValue)
 	}
 
@@ -418,8 +488,24 @@ func (f *Function) addComparisonOp(
 	}
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
+	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
+	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
+	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	lhsValue := lhsNode.milValue
+	rhsValue := rhsNode.milValue
+	lhsShape := lhsNode.shape
+	rhsShape := rhsNode.shape
+
+	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
+		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
+		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
+	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
+		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
+		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
+	}
+
 	// Compute output shape using shapeinference.ComparisonOp
-	outputShape, err := shapeinference.ComparisonOp(opType, lhsNode.shape, rhsNode.shape)
+	outputShape, err := shapeinference.ComparisonOp(opType, lhsShape, rhsShape)
 	if err != nil {
 		return nil, err
 	}
@@ -437,8 +523,6 @@ func (f *Function) addComparisonOp(
 		resultValue = f.builder.milBuilder.PlaceholderValue(placeholderName, milDType, milShape...)
 	} else {
 		// In main function context, build the MIL operation directly.
-		lhsValue := lhsNode.milValue
-		rhsValue := rhsNode.milValue
 		resultValue = milOp(lhsValue, rhsValue)
 	}
 
@@ -467,9 +551,16 @@ func (f *Function) Neg(x backends.Value) (backends.Value, error) {
 	operand := inputs[0]
 
 	// Create a constant -1 for multiplication (scalar broadcasts)
+	// Always use Float32 for the constant data, then cast to operand's dtype if needed
 	constName := fmt.Sprintf("neg_one_%d", f.builder.nextConstID)
 	f.builder.nextConstID++
-	negOne := f.builder.milBuilder.Const(constName, operand.milValue.DType(), []int64{}, []float32{-1.0})
+	negOne := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{-1.0})
+
+	// Cast to operand's dtype if it's not Float32
+	operandDType := operand.milValue.DType()
+	if operandDType != model.Float32 {
+		negOne = f.builder.milBuilder.Cast(negOne, operandDType)
+	}
 
 	// Multiply by -1 to negate
 	resultValue := f.builder.milBuilder.Mul(operand.milValue, negOne)
@@ -558,10 +649,16 @@ func (f *Function) Expm1(x backends.Value) (backends.Value, error) {
 	// exp(x)
 	expResult := f.builder.milBuilder.Exp(operand.milValue)
 
-	// Create constant 1 with the same dtype as x
+	// Create constant 1 (always use Float32 for data, then cast if needed)
 	constName := fmt.Sprintf("expm1_one_%d", f.builder.nextConstID)
 	f.builder.nextConstID++
-	one := f.builder.milBuilder.Const(constName, operand.milValue.DType(), []int64{}, []float32{1.0})
+	one := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{1.0})
+
+	// Cast to operand's dtype if it's not Float32
+	operandDType := operand.milValue.DType()
+	if operandDType != model.Float32 {
+		one = f.builder.milBuilder.Cast(one, operandDType)
+	}
 
 	// exp(x) - 1
 	resultValue := f.builder.milBuilder.Sub(expResult, one)
@@ -587,10 +684,16 @@ func (f *Function) Log1p(x backends.Value) (backends.Value, error) {
 		return nil, err
 	}
 
-	// Create constant 1 with the same dtype as x
+	// Create constant 1 (always use Float32 for data, then cast if needed)
 	constName := fmt.Sprintf("log1p_one_%d", f.builder.nextConstID)
 	f.builder.nextConstID++
-	one := f.builder.milBuilder.Const(constName, operand.milValue.DType(), []int64{}, []float32{1.0})
+	one := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{1.0})
+
+	// Cast to operand's dtype if it's not Float32
+	operandDType := operand.milValue.DType()
+	if operandDType != model.Float32 {
+		one = f.builder.milBuilder.Cast(one, operandDType)
+	}
 
 	// x + 1
 	xPlusOne := f.builder.milBuilder.Add(operand.milValue, one)
@@ -2529,6 +2632,8 @@ func intsToInt64s(ints []int) []int64 {
 // ReduceWindow runs a reduction function over sliding windows.
 // CoreML supports MaxPool and AvgPool operations which correspond to ReduceOpMax and ReduceOpSum/ReduceOpProduct.
 // CoreML expects NCHW layout for input ([N, C, H, W]).
+//
+// For tensors with rank < 3, we add fake batch/channel dimensions, apply pooling, then remove them.
 func (f *Function) ReduceWindow(
 	operandOp backends.Value,
 	reductionType backends.ReduceOpType,
@@ -2557,11 +2662,6 @@ func (f *Function) ReduceWindow(
 
 	rank := operand.shape.Rank()
 
-	// CoreML pooling requires rank >= 3 (at least [N, C, spatial])
-	if rank < 3 {
-		return nil, errors.Errorf("ReduceWindow: CoreML pooling requires at least 3 dimensions (N, C, spatial), got rank %d", rank)
-	}
-
 	// Check for unsupported features
 	if baseDilations != nil {
 		for _, d := range baseDilations {
@@ -2578,6 +2678,63 @@ func (f *Function) ReduceWindow(
 		}
 	}
 
+	// CoreML pooling only supports Float32 and Float16 tensors
+	// For other dtypes, we cast to Float32, perform the pooling, then cast back
+	operandDType := operand.shape.DType
+	needsCastBack := false
+	operandValue := operand.milValue
+
+	if operandDType != dtypes.Float32 && operandDType != dtypes.Float16 {
+		// Cast to Float32 for pooling
+		operandValue = f.builder.milBuilder.Cast(operandValue, model.Float32)
+		needsCastBack = true
+	}
+
+	// CoreML pooling requires rank >= 3 (at least [N, C, spatial])
+	// For lower rank tensors, we add fake dimensions, apply pooling, then remove them
+	effectiveRank := rank
+	dimsToSqueeze := 0
+
+	if rank < 3 {
+		// Add fake dimensions to make it at least rank 3
+		// For rank 2 [A, B]: reshape to [1, A, B] (add fake N)
+		// For rank 1 [A]: reshape to [1, 1, A] (add fake N, C)
+		dimsToSqueeze = 3 - rank
+		newShape := make([]int64, 3)
+		for i := 0; i < dimsToSqueeze; i++ {
+			newShape[i] = 1
+		}
+		for i := 0; i < rank; i++ {
+			newShape[dimsToSqueeze+i] = int64(operand.shape.Dimensions[i])
+		}
+		operandValue = f.builder.milBuilder.Reshape(operandValue, newShape)
+
+		// Adjust windowDimensions, strides, paddings to account for added dimensions
+		newWindowDims := make([]int, 3)
+		newStrides := make([]int, 3)
+		newPaddings := make([][2]int, 3)
+		for i := 0; i < dimsToSqueeze; i++ {
+			newWindowDims[i] = 1
+			newStrides[i] = 1
+			newPaddings[i] = [2]int{0, 0}
+		}
+		for i := 0; i < rank; i++ {
+			newWindowDims[dimsToSqueeze+i] = windowDimensions[i]
+			if strides != nil && i < len(strides) {
+				newStrides[dimsToSqueeze+i] = strides[i]
+			} else {
+				newStrides[dimsToSqueeze+i] = windowDimensions[i]
+			}
+			if paddings != nil && i < len(paddings) {
+				newPaddings[dimsToSqueeze+i] = paddings[i]
+			}
+		}
+		windowDimensions = newWindowDims
+		strides = newStrides
+		paddings = newPaddings
+		effectiveRank = 3
+	}
+
 	// CoreML pooling operates on spatial dimensions only (assumes NCHW layout)
 	// The window must have size 1 for batch and channel dimensions
 	if len(windowDimensions) >= 2 {
@@ -2587,7 +2744,7 @@ func (f *Function) ReduceWindow(
 	}
 
 	// Extract spatial dimensions for pooling (skip batch and channel dimensions)
-	spatialRank := rank - 2
+	spatialRank := effectiveRank - 2
 	spatialWindowDims := windowDimensions[2:]
 	if len(spatialWindowDims) != spatialRank {
 		return nil, errors.Errorf("ReduceWindow: window dimensions mismatch, expected %d spatial dims, got %d", spatialRank, len(spatialWindowDims))
@@ -2644,7 +2801,7 @@ func (f *Function) ReduceWindow(
 	switch reductionType {
 	case backends.ReduceOpMax:
 		resultValue = f.builder.milBuilder.MaxPool(
-			operand.milValue,
+			operandValue,
 			milKernelSize,
 			milStrides,
 			padType,
@@ -2657,7 +2814,7 @@ func (f *Function) ReduceWindow(
 		// AvgPool computes: sum(window) / window_size
 		// So sum = AvgPool * window_size
 		avgResult := f.builder.milBuilder.AvgPool(
-			operand.milValue,
+			operandValue,
 			milKernelSize,
 			milStrides,
 			padType,
@@ -2673,9 +2830,14 @@ func (f *Function) ReduceWindow(
 		}
 
 		// Create constant for window size and multiply
+		// Always use Float32 for data, then cast if needed
 		constName := fmt.Sprintf("reduce_window_size_%d", f.builder.nextConstID)
 		f.builder.nextConstID++
-		windowSizeConst := f.builder.milBuilder.Const(constName, avgResult.DType(), []int64{}, []float32{float32(windowSize)})
+		windowSizeConst := f.builder.milBuilder.Const(constName, model.Float32, []int64{}, []float32{float32(windowSize)})
+		avgResultDType := avgResult.DType()
+		if avgResultDType != model.Float32 {
+			windowSizeConst = f.builder.milBuilder.Cast(windowSizeConst, avgResultDType)
+		}
 		resultValue = f.builder.milBuilder.Mul(avgResult, windowSizeConst)
 
 	case backends.ReduceOpMin:
@@ -2683,10 +2845,15 @@ func (f *Function) ReduceWindow(
 		// MinPool(x) = -MaxPool(-x)
 
 		// Step 1: Negate the input
+		// Always use Float32 for data, then cast if needed
 		negOneConstName := fmt.Sprintf("minpool_neg_one_%d", f.builder.nextConstID)
 		f.builder.nextConstID++
-		negOne := f.builder.milBuilder.Const(negOneConstName, operand.milValue.DType(), []int64{}, []float32{-1.0})
-		negInput := f.builder.milBuilder.Mul(operand.milValue, negOne)
+		negOne := f.builder.milBuilder.Const(negOneConstName, model.Float32, []int64{}, []float32{-1.0})
+		operandDType := operandValue.DType()
+		if operandDType != model.Float32 {
+			negOne = f.builder.milBuilder.Cast(negOne, operandDType)
+		}
+		negInput := f.builder.milBuilder.Mul(operandValue, negOne)
 
 		// Step 2: Apply MaxPool to the negated input
 		maxPoolResult := f.builder.milBuilder.MaxPool(
@@ -2709,8 +2876,703 @@ func (f *Function) ReduceWindow(
 		return nil, errors.Errorf("ReduceWindow: unsupported reduction type %v", reductionType)
 	}
 
+	// If we added fake dimensions, squeeze them out
+	if dimsToSqueeze > 0 {
+		// Build the output shape with only the original dimensions
+		outDims := make([]int64, outputShape.Rank())
+		for i := 0; i < outputShape.Rank(); i++ {
+			outDims[i] = int64(outputShape.Dimensions[i])
+		}
+		resultValue = f.builder.milBuilder.Reshape(resultValue, outDims)
+	}
+
+	// If we cast to Float32 for pooling, cast back to original dtype
+	if needsCastBack {
+		milDType, err := gomlxDTypeToMIL(operandDType)
+		if err != nil {
+			return nil, errors.Wrapf(err, "ReduceWindow: failed to convert dtype %s back after pooling", operandDType)
+		}
+		resultValue = f.builder.milBuilder.Cast(resultValue, milDType)
+	}
+
 	// Create a new node with the result
 	node := f.builder.newNode(opType, outputShape, resultValue, operand)
 
 	return node, nil
 }
+
+// =============================================================================
+// Explicitly unimplemented operations with descriptive error messages
+// =============================================================================
+// These methods override the default notimplemented.Function methods to provide
+// clearer error messages indicating which specific operation is not supported.
+
+// Broadcast is not implemented for CoreML backend.
+func (f *Function) Broadcast(x backends.Value, shape shapes.Shape) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Broadcast is not implemented for %q backend", BackendName)
+}
+
+// BroadcastInDim broadcasts the input tensor to the target shape.
+//
+// The broadcastDims parameter specifies which dimensions of the output shape
+// correspond to dimensions of the input. For example:
+//   - Input shape: [3], Output shape: [2, 3], broadcastDims: [1]
+//     means input dim 0 maps to output dim 1, resulting in shape [2, 3]
+//   - Input shape: [2, 3], Output shape: [2, 3, 4], broadcastDims: [0, 1]
+//     means input dims map to output dims 0 and 1, resulting in shape [2, 3, 4]
+//
+// Implementation: First reshape to insert size-1 dimensions, then tile to expand.
+func (f *Function) BroadcastInDim(x backends.Value, shape shapes.Shape, broadcastDims []int) (backends.Value, error) {
+	opType := backends.OpTypeBroadcastInDim
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	inputShape := operand.shape
+	outputRank := shape.Rank()
+
+	// Validate broadcastDims
+	if len(broadcastDims) != inputShape.Rank() {
+		return nil, errors.Errorf("BroadcastInDim: broadcastDims length (%d) must match input rank (%d)",
+			len(broadcastDims), inputShape.Rank())
+	}
+
+	// Check that broadcastDims are valid and in bounds
+	for i, dim := range broadcastDims {
+		if dim < 0 || dim >= outputRank {
+			return nil, errors.Errorf("BroadcastInDim: broadcastDims[%d]=%d is out of bounds for output rank %d",
+				i, dim, outputRank)
+		}
+	}
+
+	// Check that input dimensions are compatible with output dimensions
+	for i, dim := range broadcastDims {
+		inputDim := inputShape.Dimensions[i]
+		outputDim := shape.Dimensions[dim]
+		if inputDim != 1 && inputDim != outputDim {
+			return nil, errors.Errorf("BroadcastInDim: input dimension %d (size %d) is incompatible with output dimension %d (size %d)",
+				i, inputDim, dim, outputDim)
+		}
+	}
+
+	// Build the intermediate shape: insert size-1 dimensions where input doesn't contribute
+	// For each output dimension:
+	//   - If it's in broadcastDims, use the corresponding input dimension
+	//   - Otherwise, use size 1
+	intermediateShape := make([]int64, outputRank)
+	broadcastDimSet := make(map[int]int) // output dim -> input dim
+	for inputDim, outputDim := range broadcastDims {
+		broadcastDimSet[outputDim] = inputDim
+	}
+
+	for i := 0; i < outputRank; i++ {
+		if inputDim, ok := broadcastDimSet[i]; ok {
+			intermediateShape[i] = int64(inputShape.Dimensions[inputDim])
+		} else {
+			intermediateShape[i] = 1
+		}
+	}
+
+	// Reshape to intermediate shape
+	resultValue := f.builder.milBuilder.Reshape(operand.milValue, intermediateShape)
+
+	// Build tile repetitions: for each dimension, tile by output_size / intermediate_size
+	needsTile := false
+	tileReps := make([]int64, outputRank)
+	for i := 0; i < outputRank; i++ {
+		outputDim := int64(shape.Dimensions[i])
+		tileReps[i] = outputDim / intermediateShape[i]
+		if tileReps[i] != 1 {
+			needsTile = true
+		}
+	}
+
+	// Only tile if necessary
+	if needsTile {
+		resultValue = f.builder.milBuilder.Tile(resultValue, tileReps)
+	}
+
+	// Create a new node with the result
+	node := f.builder.newNode(opType, shape, resultValue, operand)
+
+	return node, nil
+}
+
+// Select is not implemented for CoreML backend.
+func (f *Function) Select(onTrue, onFalse, condition backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Select is not implemented for %q backend (use Where instead)", BackendName)
+}
+
+// Clamp clamps the input tensor values to be within [min, max].
+func (f *Function) Clamp(x, min, max backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeClamp
+	inputs, err := f.builder.checkOps(opType.String(), x, min, max)
+	if err != nil {
+		return nil, err
+	}
+	xNode, minNode, maxNode := inputs[0], inputs[1], inputs[2]
+
+	// Compute output shape by broadcasting all three inputs
+	// First broadcast x with min, then that result with max
+	xMinShape, err := shapeinference.BinaryOp(backends.OpTypeMax, xNode.shape, minNode.shape)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Clamp: incompatible shapes for x and min")
+	}
+	outputShape, err := shapeinference.BinaryOp(backends.OpTypeMin, xMinShape, maxNode.shape)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Clamp: incompatible shapes for (x,min) and max")
+	}
+
+	// Use MIL's Clip operation which clamps values to [min, max]
+	resultValue := f.builder.milBuilder.Clip(xNode.milValue, minNode.milValue, maxNode.milValue)
+	node := f.builder.newNode(opType, outputShape, resultValue, xNode, minNode, maxNode)
+	return node, nil
+}
+
+// And is not implemented for CoreML backend.
+func (f *Function) And(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"And (logical) is not implemented for %q backend", BackendName)
+}
+
+// Or is not implemented for CoreML backend.
+func (f *Function) Or(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Or (logical) is not implemented for %q backend", BackendName)
+}
+
+// Not is not implemented for CoreML backend.
+func (f *Function) Not(x backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Not (logical) is not implemented for %q backend", BackendName)
+}
+
+// Xor is not implemented for CoreML backend.
+func (f *Function) Xor(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Xor (logical) is not implemented for %q backend", BackendName)
+}
+
+// Rem is not implemented for CoreML backend.
+func (f *Function) Rem(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Rem (remainder/modulo) is not implemented for %q backend", BackendName)
+}
+
+// Atan2 is not implemented for CoreML backend.
+func (f *Function) Atan2(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Atan2 is not implemented for %q backend", BackendName)
+}
+
+// ShiftLeft is not implemented for CoreML backend.
+func (f *Function) ShiftLeft(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ShiftLeft is not implemented for %q backend", BackendName)
+}
+
+// ShiftRight is not implemented for CoreML backend.
+func (f *Function) ShiftRight(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ShiftRight is not implemented for %q backend", BackendName)
+}
+
+// Real is not implemented for CoreML backend.
+func (f *Function) Real(x backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Real (complex number) is not implemented for %q backend", BackendName)
+}
+
+// Imag is not implemented for CoreML backend.
+func (f *Function) Imag(x backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Imag (complex number) is not implemented for %q backend", BackendName)
+}
+
+// Complex is not implemented for CoreML backend.
+func (f *Function) Complex(real, imag backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Complex (complex number) is not implemented for %q backend", BackendName)
+}
+
+// Conj is not implemented for CoreML backend.
+func (f *Function) Conj(x backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Conj (complex conjugate) is not implemented for %q backend", BackendName)
+}
+
+// FFT is not implemented for CoreML backend.
+func (f *Function) FFT(x backends.Value, fftType backends.FFTType, fftLengths []int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"FFT is not implemented for %q backend", BackendName)
+}
+
+// Scatter is not implemented for CoreML backend.
+func (f *Function) Scatter(operand, indices, updates backends.Value, indexVectorDim int, updateWindowDims, insertedWindowDims, scatterDimsToOperandDims []int, indicesAreSorted, uniqueIndices bool) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Scatter is not implemented for %q backend", BackendName)
+}
+
+// BatchNormForInference is not implemented for CoreML backend.
+func (f *Function) BatchNormForInference(operand, scale, offset, mean, variance backends.Value, epsilon float32, axis int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BatchNormForInference is not implemented for %q backend", BackendName)
+}
+
+// BatchNormForTraining is not implemented for CoreML backend.
+func (f *Function) BatchNormForTraining(operand, scale, offset backends.Value, epsilon float32, axis int) (output, batchMean, batchVariance backends.Value, err error) {
+	return nil, nil, nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BatchNormForTraining is not implemented for %q backend", BackendName)
+}
+
+// BatchNormGrad is not implemented for CoreML backend.
+func (f *Function) BatchNormGrad(operand, scale, mean, variance, gradOutput backends.Value, epsilon float32, axis int) (gradOperand, gradScale, gradOffset backends.Value, err error) {
+	return nil, nil, nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BatchNormGrad is not implemented for %q backend", BackendName)
+}
+
+// Cholesky is not implemented for CoreML backend.
+func (f *Function) Cholesky(x backends.Value, lower bool) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Cholesky is not implemented for %q backend", BackendName)
+}
+
+// TriangularSolve is not implemented for CoreML backend.
+func (f *Function) TriangularSolve(a, b backends.Value, leftSide, lower, unitDiagonal, transposeA bool) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"TriangularSolve is not implemented for %q backend", BackendName)
+}
+
+// RngBitGenerator is not implemented for CoreML backend.
+func (f *Function) RngBitGenerator(algorithm int, initialState backends.Value, outputShape shapes.Shape) (state backends.Value, output backends.Value, err error) {
+	return nil, nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"RngBitGenerator is not implemented for %q backend", BackendName)
+}
+
+// Tuple is not implemented for CoreML backend.
+func (f *Function) Tuple(elements ...backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Tuple is not implemented for %q backend", BackendName)
+}
+
+// GetTupleElement is not implemented for CoreML backend.
+func (f *Function) GetTupleElement(tuple backends.Value, index int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"GetTupleElement is not implemented for %q backend", BackendName)
+}
+
+// ReduceAnd is not implemented for CoreML backend.
+func (f *Function) ReduceAnd(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceAnd is not implemented for %q backend", BackendName)
+}
+
+// ReduceOr is not implemented for CoreML backend.
+func (f *Function) ReduceOr(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceOr is not implemented for %q backend", BackendName)
+}
+
+// ReduceMean is not implemented for CoreML backend.
+// Note: GoMLX computes ReduceMean as ReduceSum / count at the graph level,
+// so this operation is not called directly.
+func (f *Function) ReduceMean(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceMean is not implemented for %q backend (GoMLX computes this as ReduceSum / count)", BackendName)
+}
+
+// Identity returns the input unchanged. This is useful for control flow and debugging.
+func (f *Function) Identity(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeIdentity
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Generate unique name for the identity op
+	identityName := fmt.Sprintf("identity_%d", f.builder.nextConstID)
+	f.builder.nextConstID++
+
+	// Identity just passes through the value - use MIL's Identity op
+	resultValue := f.builder.milBuilder.Identity(identityName, operand.milValue)
+
+	// Create a new node with the same shape
+	node := f.builder.newNode(opType, operand.shape, resultValue, operand)
+	return node, nil
+}
+
+// DynamicSlice extracts a sub-tensor starting at the given indices with the given sizes.
+// This is like Slice but with dynamic (computed at runtime) start indices.
+func (f *Function) DynamicSlice(x backends.Value, startIndices []backends.Value, sliceSizes []int) (backends.Value, error) {
+	opType := backends.OpTypeDynamicSlice
+	// Check x first
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operandNode := inputs[0]
+
+	// Check startIndices
+	if len(startIndices) != operandNode.shape.Rank() {
+		return nil, errors.Errorf("DynamicSlice: startIndices length (%d) must match operand rank (%d)",
+			len(startIndices), operandNode.shape.Rank())
+	}
+	if len(sliceSizes) != operandNode.shape.Rank() {
+		return nil, errors.Errorf("DynamicSlice: sliceSizes length (%d) must match operand rank (%d)",
+			len(sliceSizes), operandNode.shape.Rank())
+	}
+
+	startIndexNodes, err := f.builder.checkOps(opType.String(), startIndices...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate that each start index is a scalar or size-1 tensor
+	for i, idx := range startIndexNodes {
+		if idx.shape.Rank() > 1 || (idx.shape.Rank() == 1 && idx.shape.Dimensions[0] != 1) {
+			return nil, errors.Errorf("DynamicSlice: startIndices[%d] must be a scalar or size-1 tensor, got shape %s",
+				i, idx.shape)
+		}
+	}
+
+	// Output shape is determined by sliceSizes
+	outputShape := shapes.Make(operandNode.shape.DType, sliceSizes...)
+
+	// Build the begin indices tensor by stacking individual indices
+	// CoreML's SliceBySize expects begin as a 1D tensor of shape [rank]
+	rank := operandNode.shape.Rank()
+
+	// Stack all start indices into a 1D tensor
+	var beginParts []*model.Value
+	for i := 0; i < rank; i++ {
+		idx := startIndexNodes[i].milValue
+		// Reshape to [1] if it's a scalar
+		if startIndexNodes[i].shape.Rank() == 0 {
+			idx = f.builder.milBuilder.Reshape(idx, []int64{1})
+		}
+		// Cast to Int32 if needed
+		if startIndexNodes[i].shape.DType != dtypes.Int32 {
+			idx = f.builder.milBuilder.Cast(idx, model.Int32)
+		}
+		beginParts = append(beginParts, idx)
+	}
+
+	var beginValue *model.Value
+	if rank == 1 {
+		beginValue = beginParts[0]
+	} else {
+		beginValue = f.builder.milBuilder.Concat(beginParts, 0)
+	}
+
+	// Convert sliceSizes to int64 for MIL
+	milSizes := make([]int64, rank)
+	for i, s := range sliceSizes {
+		milSizes[i] = int64(s)
+	}
+
+	// Call MIL's SliceBySize
+	resultValue := f.builder.milBuilder.SliceBySize(operandNode.milValue, beginValue, milSizes)
+
+	node := f.builder.newNode(opType, outputShape, resultValue, operandNode)
+	// Add startIndexNodes as additional inputs for tracking
+	node.inputs = append(node.inputs, startIndexNodes...)
+
+	return node, nil
+}
+
+// LogicalAnd returns the element-wise logical AND of the inputs.
+func (f *Function) LogicalAnd(lhs, rhs backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalAnd
+	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
+	if err != nil {
+		return nil, err
+	}
+	lhsNode, rhsNode := inputs[0], inputs[1]
+
+	// Validate inputs are boolean
+	if lhsNode.shape.DType != dtypes.Bool || rhsNode.shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("LogicalAnd: inputs must be Bool dtype, got %s and %s",
+			lhsNode.shape.DType, rhsNode.shape.DType)
+	}
+
+	// Use shape inference for broadcasting
+	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	if err != nil {
+		return nil, errors.Wrapf(err, "LogicalAnd")
+	}
+
+	resultValue := f.builder.milBuilder.LogicalAnd(lhsNode.milValue, rhsNode.milValue)
+	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
+	return node, nil
+}
+
+// LogicalOr returns the element-wise logical OR of the inputs.
+func (f *Function) LogicalOr(lhs, rhs backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalOr
+	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
+	if err != nil {
+		return nil, err
+	}
+	lhsNode, rhsNode := inputs[0], inputs[1]
+
+	// Validate inputs are boolean
+	if lhsNode.shape.DType != dtypes.Bool || rhsNode.shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("LogicalOr: inputs must be Bool dtype, got %s and %s",
+			lhsNode.shape.DType, rhsNode.shape.DType)
+	}
+
+	// Use shape inference for broadcasting
+	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	if err != nil {
+		return nil, errors.Wrapf(err, "LogicalOr")
+	}
+
+	resultValue := f.builder.milBuilder.LogicalOr(lhsNode.milValue, rhsNode.milValue)
+	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
+	return node, nil
+}
+
+// LogicalNot returns the element-wise logical NOT of the input.
+func (f *Function) LogicalNot(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalNot
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Validate input is boolean
+	if operand.shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("LogicalNot: input must be Bool dtype, got %s", operand.shape.DType)
+	}
+
+	// Call the MIL LogicalNot operation
+	resultValue := f.builder.milBuilder.LogicalNot(operand.milValue)
+
+	// Create a new node with the result (same shape as input)
+	node := f.builder.newNode(opType, operand.shape, resultValue, operand)
+
+	return node, nil
+}
+
+// LogicalXor returns the element-wise logical XOR of the inputs.
+func (f *Function) LogicalXor(lhs, rhs backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeLogicalXor
+	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
+	if err != nil {
+		return nil, err
+	}
+	lhsNode, rhsNode := inputs[0], inputs[1]
+
+	// Validate inputs are boolean
+	if lhsNode.shape.DType != dtypes.Bool || rhsNode.shape.DType != dtypes.Bool {
+		return nil, errors.Errorf("LogicalXor: inputs must be Bool dtype, got %s and %s",
+			lhsNode.shape.DType, rhsNode.shape.DType)
+	}
+
+	// Use shape inference for broadcasting
+	outputShape, err := shapeinference.BinaryOp(opType, lhsNode.shape, rhsNode.shape)
+	if err != nil {
+		return nil, errors.Wrapf(err, "LogicalXor")
+	}
+
+	resultValue := f.builder.milBuilder.LogicalXor(lhsNode.milValue, rhsNode.milValue)
+	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
+	return node, nil
+}
+
+// Bitcast is not implemented for CoreML backend.
+func (f *Function) Bitcast(x backends.Value, targetDType dtypes.DType) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Bitcast is not implemented for %q backend", BackendName)
+}
+
+// BitCount is not implemented for CoreML backend.
+func (f *Function) BitCount(x backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BitCount is not implemented for %q backend", BackendName)
+}
+
+// BitwiseAnd is not implemented for CoreML backend.
+func (f *Function) BitwiseAnd(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BitwiseAnd is not implemented for %q backend", BackendName)
+}
+
+// BitwiseOr is not implemented for CoreML backend.
+func (f *Function) BitwiseOr(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BitwiseOr is not implemented for %q backend", BackendName)
+}
+
+// BitwiseNot is not implemented for CoreML backend.
+func (f *Function) BitwiseNot(x backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BitwiseNot is not implemented for %q backend", BackendName)
+}
+
+// BitwiseXor is not implemented for CoreML backend.
+func (f *Function) BitwiseXor(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"BitwiseXor is not implemented for %q backend", BackendName)
+}
+
+// Clz is not implemented for CoreML backend.
+func (f *Function) Clz(x backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"Clz (count leading zeros) is not implemented for %q backend", BackendName)
+}
+
+// IsNaN returns a boolean tensor indicating which elements are NaN.
+func (f *Function) IsNaN(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeIsNaN
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Output shape is the same as input but with Bool dtype
+	outputShape := shapes.Make(dtypes.Bool, operand.shape.Dimensions...)
+
+	resultValue := f.builder.milBuilder.IsNan(operand.milValue)
+	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+	return node, nil
+}
+
+// IsFinite returns a boolean tensor indicating which elements are finite (not NaN or Inf).
+func (f *Function) IsFinite(x backends.Value) (backends.Value, error) {
+	opType := backends.OpTypeIsFinite
+	inputs, err := f.builder.checkOps(opType.String(), x)
+	if err != nil {
+		return nil, err
+	}
+	operand := inputs[0]
+
+	// Output shape is the same as input but with Bool dtype
+	outputShape := shapes.Make(dtypes.Bool, operand.shape.Dimensions...)
+
+	resultValue := f.builder.milBuilder.IsFinite(operand.milValue)
+	node := f.builder.newNode(opType, outputShape, resultValue, operand)
+	return node, nil
+}
+
+// ScatterMax is not implemented for CoreML backend.
+func (f *Function) ScatterMax(operand, indices, updates backends.Value, indexVectorDim int, updateWindowDims, insertedWindowDims, scatterDimsToOperandDims []int, indicesAreSorted, uniqueIndices bool) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ScatterMax is not implemented for %q backend", BackendName)
+}
+
+// ScatterMin is not implemented for CoreML backend.
+func (f *Function) ScatterMin(operand, indices, updates backends.Value, indexVectorDim int, updateWindowDims, insertedWindowDims, scatterDimsToOperandDims []int, indicesAreSorted, uniqueIndices bool) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ScatterMin is not implemented for %q backend", BackendName)
+}
+
+// ScatterSum is not implemented for CoreML backend.
+func (f *Function) ScatterSum(operand, indices, updates backends.Value, indexVectorDim int, updateWindowDims, insertedWindowDims, scatterDimsToOperandDims []int, indicesAreSorted, uniqueIndices bool) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ScatterSum is not implemented for %q backend", BackendName)
+}
+
+// SelectAndScatterMax is not implemented for CoreML backend.
+func (f *Function) SelectAndScatterMax(operand, source backends.Value, windowDimensions, windowStrides []int, padding [][2]int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"SelectAndScatterMax is not implemented for %q backend", BackendName)
+}
+
+// SelectAndScatterMin is not implemented for CoreML backend.
+func (f *Function) SelectAndScatterMin(operand, source backends.Value, windowDimensions, windowStrides []int, padding [][2]int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"SelectAndScatterMin is not implemented for %q backend", BackendName)
+}
+
+// ReduceBitwiseAnd is not implemented for CoreML backend.
+func (f *Function) ReduceBitwiseAnd(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceBitwiseAnd is not implemented for %q backend", BackendName)
+}
+
+// ReduceBitwiseOr is not implemented for CoreML backend.
+func (f *Function) ReduceBitwiseOr(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceBitwiseOr is not implemented for %q backend", BackendName)
+}
+
+// ReduceBitwiseXor is not implemented for CoreML backend.
+func (f *Function) ReduceBitwiseXor(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceBitwiseXor is not implemented for %q backend", BackendName)
+}
+
+// ReduceLogicalAnd is not implemented for CoreML backend.
+func (f *Function) ReduceLogicalAnd(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceLogicalAnd is not implemented for %q backend", BackendName)
+}
+
+// ReduceLogicalOr is not implemented for CoreML backend.
+func (f *Function) ReduceLogicalOr(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceLogicalOr is not implemented for %q backend", BackendName)
+}
+
+// ReduceLogicalXor is not implemented for CoreML backend.
+func (f *Function) ReduceLogicalXor(x backends.Value, axes ...int) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ReduceLogicalXor is not implemented for %q backend", BackendName)
+}
+
+// ShiftRightArithmetic is not implemented for CoreML backend.
+func (f *Function) ShiftRightArithmetic(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ShiftRightArithmetic is not implemented for %q backend", BackendName)
+}
+
+// ShiftRightLogical is not implemented for CoreML backend.
+func (f *Function) ShiftRightLogical(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"ShiftRightLogical is not implemented for %q backend", BackendName)
+}
+
+// EqualTotalOrder is not implemented for CoreML backend.
+func (f *Function) EqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"EqualTotalOrder is not implemented for %q backend", BackendName)
+}
+
+// NotEqualTotalOrder is not implemented for CoreML backend.
+func (f *Function) NotEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"NotEqualTotalOrder is not implemented for %q backend", BackendName)
+}
+
+// LessThanTotalOrder is not implemented for CoreML backend.
+func (f *Function) LessThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"LessThanTotalOrder is not implemented for %q backend", BackendName)
+}
+
+// LessOrEqualTotalOrder is not implemented for CoreML backend.
+func (f *Function) LessOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"LessOrEqualTotalOrder is not implemented for %q backend", BackendName)
+}
+
+// GreaterThanTotalOrder is not implemented for CoreML backend.
+func (f *Function) GreaterThanTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"GreaterThanTotalOrder is not implemented for %q backend", BackendName)
+}
+
+// GreaterOrEqualTotalOrder is not implemented for CoreML backend.
+func (f *Function) GreaterOrEqualTotalOrder(lhs, rhs backends.Value) (backends.Value, error) {
+	return nil, errors.Wrapf(notimplemented.NotImplementedError,
+		"GreaterOrEqualTotalOrder is not implemented for %q backend", BackendName)
+}
+
