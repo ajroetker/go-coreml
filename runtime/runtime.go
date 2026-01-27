@@ -35,6 +35,13 @@ import (
 type Runtime struct {
 	cacheDir     string
 	computeUnits bridge.ComputeUnits
+
+	// Shared weight storage — the first compilation writes weight.bin,
+	// subsequent compilations symlink to it. This avoids writing identical
+	// weight data for every input shape compiled from the same model.
+	mu                sync.Mutex
+	sharedWeightsPath string // Path to the reusable weight.bin
+	sharedWeightsDir  string // Temp dir holding shared weights (cleaned up on Close)
 }
 
 // Option configures the runtime.
@@ -65,6 +72,17 @@ func New(opts ...Option) *Runtime {
 	}
 	bridge.SetComputeUnits(r.computeUnits)
 	return r
+}
+
+// Close releases resources held by the runtime, including shared weight storage.
+func (r *Runtime) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sharedWeightsDir != "" {
+		os.RemoveAll(r.sharedWeightsDir)
+		r.sharedWeightsDir = ""
+		r.sharedWeightsPath = ""
+	}
 }
 
 // Executable represents a compiled CoreML model ready for execution.
@@ -101,9 +119,58 @@ func (r *Runtime) CompileProgram(program *model.Program, inputs, outputs []model
 	// of large weight tensors instead of loading them inline from protobuf.
 	packagePath := filepath.Join(tempDir, "model.mlpackage")
 	blobOpts := model.DefaultBlobOptions()
+
+	// Reuse shared weights from a prior compilation if available.
+	r.mu.Lock()
+	sharedPath := r.sharedWeightsPath
+	r.mu.Unlock()
+
+	if sharedPath != "" {
+		blobOpts.SharedWeightsPath = sharedPath
+	}
+
 	if err := model.SaveMLPackageWithBlobs(coremlModel, packagePath, blobOpts); err != nil {
 		os.RemoveAll(tempDir)
 		return nil, fmt.Errorf("save mlpackage: %w", err)
+	}
+
+	// First compilation: move weight.bin to a shared directory so it survives
+	// individual Executable.Close() calls, then symlink back.
+	if sharedPath == "" {
+		weightsPath := filepath.Join(packagePath, "Data", "com.apple.CoreML", "weights", "weight.bin")
+		if info, err := os.Stat(weightsPath); err == nil && info.Size() > 0 {
+			sharedDir, err := os.MkdirTemp(r.cacheDir, "gocoreml-weights-")
+			if err != nil {
+				os.RemoveAll(tempDir)
+				return nil, fmt.Errorf("create shared weights dir: %w", err)
+			}
+			sharedWeightsDir := filepath.Join(sharedDir, "weights")
+			if err := os.MkdirAll(sharedWeightsDir, 0755); err != nil {
+				os.RemoveAll(sharedDir)
+				os.RemoveAll(tempDir)
+				return nil, fmt.Errorf("create shared weights subdir: %w", err)
+			}
+			sharedWeightPath := filepath.Join(sharedWeightsDir, "weight.bin")
+
+			// Move weight.bin to the shared location
+			if err := os.Rename(weightsPath, sharedWeightPath); err != nil {
+				os.RemoveAll(sharedDir)
+				os.RemoveAll(tempDir)
+				return nil, fmt.Errorf("move weight.bin to shared dir: %w", err)
+			}
+
+			// Symlink back so CompileModel still finds it
+			if err := os.Symlink(sharedWeightPath, weightsPath); err != nil {
+				os.RemoveAll(sharedDir)
+				os.RemoveAll(tempDir)
+				return nil, fmt.Errorf("symlink weight.bin back: %w", err)
+			}
+
+			r.mu.Lock()
+			r.sharedWeightsPath = sharedWeightPath
+			r.sharedWeightsDir = sharedDir
+			r.mu.Unlock()
+		}
 	}
 
 	// Compile the model using CoreML's MLModel.compileModel(at:)
