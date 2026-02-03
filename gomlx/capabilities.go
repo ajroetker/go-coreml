@@ -119,7 +119,7 @@ var Capabilities = backends.Capabilities{
 	DTypes: map[dtypes.DType]bool{
 		dtypes.Float16: true,
 		dtypes.Float32: true,
-		dtypes.Float64: true,
+		dtypes.Float64: true, // Silently downcast to Float32 — CoreML doesn't natively support fp64.
 		dtypes.Int8:    true,
 		dtypes.Int16:   true,
 		dtypes.Int32:   true,

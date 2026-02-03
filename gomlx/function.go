@@ -134,6 +134,11 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 	if dtype == dtypes.InvalidDType {
 		return nil, errors.Errorf("invalid shape %s for Parameter", shape)
 	}
+	// CoreML does not support float64 — downcast to float32.
+	if dtype == dtypes.Float64 {
+		shape = shapes.Make(dtypes.Float32, shape.Dimensions...)
+		dtype = dtypes.Float32
+	}
 	if supported, ok := Capabilities.DTypes[dtype]; !ok || !supported {
 		return nil, errors.Errorf("Parameter: data type (DType) %s not supported for backend %q, try using "+
 			"a different backend, or open an issue in github.com/gomlx/gomlx", dtype, f.builder.backend.Name())
@@ -233,6 +238,17 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	// where out-of-range Int64 constants are typically attention mask values
 	// (large negatives) where the exact magnitude doesn't matter.
 	milData := flat
+	// CoreML does not support float64 — downcast to float32.
+	if dtype == dtypes.Float64 {
+		float64Data := flat.([]float64)
+		float32Data := make([]float32, len(float64Data))
+		for i, v := range float64Data {
+			float32Data[i] = float32(v)
+		}
+		milData = float32Data
+		milDType = model.Float32
+		shape = shapes.Make(dtypes.Float32, dims...)
+	}
 	if dtype == dtypes.Int64 && milDType == model.Int32 {
 		int64Data := flat.([]int64)
 		milData = convertInt64ToInt32Clamped(int64Data)
@@ -1528,6 +1544,11 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 		return nil, err
 	}
 	operand := inputs[0]
+
+	// CoreML does not support float64 operations — downcast to float32.
+	if dtype == dtypes.Float64 {
+		dtype = dtypes.Float32
+	}
 
 	// Convert GoMLX dtype to CoreML dtype
 	milDType, err := gomlxDTypeToMIL(dtype)
