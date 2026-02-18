@@ -49,10 +49,10 @@ func BenchmarkMatMulCompilation(b *testing.B) {
 					b.Fatalf("Parameter() for rhs failed: %v", err)
 				}
 
-				// Matrix multiplication using Dot
-				result, err := mainFn.Dot(lhs, rhs)
+				// Matrix multiplication using DotGeneral
+				result, err := mainFn.DotGeneral(lhs, []int{1}, []int{}, rhs, []int{0}, []int{}, backends.DotGeneralConfig{})
 				if err != nil {
-					b.Fatalf("Dot() failed: %v", err)
+					b.Fatalf("DotGeneral() failed: %v", err)
 				}
 
 				if err := mainFn.Return([]backends.Value{result}, nil); err != nil {
@@ -110,10 +110,10 @@ func BenchmarkMatMulExecution(b *testing.B) {
 				b.Fatalf("Parameter() for rhs failed: %v", err)
 			}
 
-			// Matrix multiplication using Dot
-			result, err := mainFn.Dot(lhs, rhs)
+			// Matrix multiplication using DotGeneral
+			result, err := mainFn.DotGeneral(lhs, []int{1}, []int{}, rhs, []int{0}, []int{}, backends.DotGeneralConfig{})
 			if err != nil {
-				b.Fatalf("Dot() failed: %v", err)
+				b.Fatalf("DotGeneral() failed: %v", err)
 			}
 
 			if err := mainFn.Return([]backends.Value{result}, nil); err != nil {

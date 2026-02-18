@@ -134,6 +134,11 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 	if dtype == dtypes.InvalidDType {
 		return nil, errors.Errorf("invalid shape %s for Parameter", shape)
 	}
+	// CoreML does not support float64 — downcast to float32.
+	if dtype == dtypes.Float64 {
+		shape = shapes.Make(dtypes.Float32, shape.Dimensions...)
+		dtype = dtypes.Float32
+	}
 	if supported, ok := Capabilities.DTypes[dtype]; !ok || !supported {
 		return nil, errors.Errorf("Parameter: data type (DType) %s not supported for backend %q, try using "+
 			"a different backend, or open an issue in github.com/gomlx/gomlx", dtype, f.builder.backend.Name())
@@ -233,6 +238,17 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 	// where out-of-range Int64 constants are typically attention mask values
 	// (large negatives) where the exact magnitude doesn't matter.
 	milData := flat
+	// CoreML does not support float64 — downcast to float32.
+	if dtype == dtypes.Float64 {
+		float64Data := flat.([]float64)
+		float32Data := make([]float32, len(float64Data))
+		for i, v := range float64Data {
+			float32Data[i] = float32(v)
+		}
+		milData = float32Data
+		milDType = model.Float32
+		shape = shapes.Make(dtypes.Float32, dims...)
+	}
 	if dtype == dtypes.Int64 && milDType == model.Int32 {
 		int64Data := flat.([]int64)
 		milData = convertInt64ToInt32Clamped(int64Data)
@@ -910,63 +926,6 @@ func (f *Function) Slice(x backends.Value, starts, limits, strides []int) (backe
 	return node, nil
 }
 
-// Dot implements backends.Function (matrix multiplication).
-func (f *Function) Dot(lhs, rhs backends.Value) (backends.Value, error) {
-	opType := backends.OpTypeDot
-	inputs, err := f.builder.checkOps(opType.String(), lhs, rhs)
-	if err != nil {
-		return nil, err
-	}
-	lhsNode, rhsNode := inputs[0], inputs[1]
-
-	// Dot is for 1D or 2D tensors - for 2D it's a matrix multiplication
-	// For 1D vectors, it's an inner product
-	lhsShape := lhsNode.shape
-	rhsShape := rhsNode.shape
-
-	var outputShape shapes.Shape
-	if lhsShape.Rank() == 1 && rhsShape.Rank() == 1 {
-		// Inner product: [N] dot [N] -> scalar
-		if lhsShape.Dimensions[0] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: vector lengths must match, got %d and %d",
-				lhsShape.Dimensions[0], rhsShape.Dimensions[0])
-		}
-		outputShape = shapes.Make(lhsShape.DType)
-	} else if lhsShape.Rank() == 2 && rhsShape.Rank() == 2 {
-		// Matrix multiplication: [M, K] dot [K, N] -> [M, N]
-		if lhsShape.Dimensions[1] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: matrix inner dimensions must match, got [%d, %d] and [%d, %d]",
-				lhsShape.Dimensions[0], lhsShape.Dimensions[1],
-				rhsShape.Dimensions[0], rhsShape.Dimensions[1])
-		}
-		outputShape = shapes.Make(lhsShape.DType, lhsShape.Dimensions[0], rhsShape.Dimensions[1])
-	} else if lhsShape.Rank() == 2 && rhsShape.Rank() == 1 {
-		// Matrix-vector: [M, K] dot [K] -> [M]
-		if lhsShape.Dimensions[1] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: matrix column count must match vector length, got %d and %d",
-				lhsShape.Dimensions[1], rhsShape.Dimensions[0])
-		}
-		outputShape = shapes.Make(lhsShape.DType, lhsShape.Dimensions[0])
-	} else if lhsShape.Rank() == 1 && rhsShape.Rank() == 2 {
-		// Vector-matrix: [K] dot [K, N] -> [N]
-		if lhsShape.Dimensions[0] != rhsShape.Dimensions[0] {
-			return nil, errors.Errorf("Dot: vector length must match matrix row count, got %d and %d",
-				lhsShape.Dimensions[0], rhsShape.Dimensions[0])
-		}
-		outputShape = shapes.Make(lhsShape.DType, rhsShape.Dimensions[1])
-	} else {
-		return nil, errors.Errorf("Dot: only supports 1D and 2D tensors, got ranks %d and %d",
-			lhsShape.Rank(), rhsShape.Rank())
-	}
-
-	// Call the MIL operation (MatMul)
-	resultValue := f.builder.milBuilder.MatMul(lhsNode.milValue, rhsNode.milValue)
-
-	// Create a new node with the result
-	node := f.builder.newNode(opType, outputShape, resultValue, lhsNode, rhsNode)
-
-	return node, nil
-}
 
 // ArgMinMax implements backends.Function.
 func (f *Function) ArgMinMax(x backends.Value, axis int, outputDType dtypes.DType, isMin bool) (backends.Value, error) {
@@ -1529,6 +1488,11 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 	}
 	operand := inputs[0]
 
+	// CoreML does not support float64 operations — downcast to float32.
+	if dtype == dtypes.Float64 {
+		dtype = dtypes.Float32
+	}
+
 	// Convert GoMLX dtype to CoreML dtype
 	milDType, err := gomlxDTypeToMIL(dtype)
 	if err != nil {
@@ -1555,7 +1519,7 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 // - Crosses all other axes
 //
 // The output shape is: [batch dims..., lhs cross dims..., rhs cross dims...]
-func (f *Function) DotGeneral(lhsOp backends.Value, lhsContractingAxes, lhsBatchAxes []int, rhsOp backends.Value, rhsContractingAxes, rhsBatchAxes []int) (backends.Value, error) {
+func (f *Function) DotGeneral(lhsOp backends.Value, lhsContractingAxes, lhsBatchAxes []int, rhsOp backends.Value, rhsContractingAxes, rhsBatchAxes []int, config backends.DotGeneralConfig) (backends.Value, error) {
 	opType := backends.OpTypeDotGeneral
 	inputs, err := f.builder.checkOps(opType.String(), lhsOp, rhsOp)
 	if err != nil {
