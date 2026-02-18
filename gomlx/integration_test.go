@@ -150,7 +150,7 @@ func TestDotGeneralSimpleMatMul(t *testing.T) {
 	}
 
 	// DotGeneral: contract axis 1 of lhs with axis 0 of rhs
-	result, err := mainFn.DotGeneral(lhs, []int{1}, []int{}, rhs, []int{0}, []int{})
+	result, err := mainFn.DotGeneral(lhs, []int{1}, []int{}, rhs, []int{0}, []int{}, backends.DotGeneralConfig{})
 	if err != nil {
 		t.Fatalf("DotGeneral() failed: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestBatchedMatMul(t *testing.T) {
 	}
 
 	// DotGeneral: batch axis 0, contract axis 2 of lhs with axis 1 of rhs
-	result, err := mainFn.DotGeneral(lhs, []int{2}, []int{0}, rhs, []int{1}, []int{0})
+	result, err := mainFn.DotGeneral(lhs, []int{2}, []int{0}, rhs, []int{1}, []int{0}, backends.DotGeneralConfig{})
 	if err != nil {
 		t.Fatalf("DotGeneral() failed: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestDotGeneralVectorDot(t *testing.T) {
 
 	// Dot product: a · b = sum(a[i] * b[i])
 	// DotGeneral with contracting axis 0 on both sides
-	result, err := mainFn.DotGeneral(a, []int{0}, nil, b, []int{0}, nil)
+	result, err := mainFn.DotGeneral(a, []int{0}, nil, b, []int{0}, nil, backends.DotGeneralConfig{})
 	if err != nil {
 		t.Fatalf("DotGeneral() failed: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestAttentionBlock(t *testing.T) {
 	// Q @ K^T: [1, 4, 8] @ [1, 8, 4] -> [1, 4, 4]
 	// batch axis: 0, contract Q axis 2 with K axis 2 (transposing K)
 	// This gives us Q @ K^T semantics
-	result, err := mainFn.DotGeneral(q, []int{2}, []int{0}, k, []int{2}, []int{0})
+	result, err := mainFn.DotGeneral(q, []int{2}, []int{0}, k, []int{2}, []int{0}, backends.DotGeneralConfig{})
 	if err != nil {
 		t.Fatalf("DotGeneral() failed: %v", err)
 	}
