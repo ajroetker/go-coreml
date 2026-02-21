@@ -5,7 +5,6 @@ package coreml
 import (
 	"reflect"
 	"sync"
-	"unsafe"
 
 	"github.com/gomlx/go-coreml/runtime"
 	"github.com/gomlx/gomlx/backends"
@@ -85,7 +84,7 @@ func (e *Executable) Execute(inputs []backends.Buffer, donate []bool, defaultDev
 	}
 
 	// Validate input shapes and convert to runtime format
-	runtimeInputs := make(map[string]interface{}, len(inputs))
+	runtimeInputs := make(map[string]any, len(inputs))
 	for i, input := range inputs {
 		if input == nil {
 			return nil, errors.Errorf("Execute: input #%d is nil", i)
@@ -139,7 +138,7 @@ func (e *Executable) Execute(inputs []backends.Buffer, donate []bool, defaultDev
 
 // bufferToRuntimeData converts a CoreML Buffer to the data format expected by go-coreml runtime.
 // The runtime expects slices of the appropriate type ([]float32, []int32, etc.).
-func bufferToRuntimeData(buffer *Buffer) (interface{}, error) {
+func bufferToRuntimeData(buffer *Buffer) (any, error) {
 	if buffer.flat == nil {
 		return nil, errors.New("buffer has nil data")
 	}
@@ -195,107 +194,53 @@ func bufferToRuntimeData(buffer *Buffer) (interface{}, error) {
 }
 
 // runtimeDataToBuffer converts data from go-coreml runtime format to a CoreML Buffer.
-func (b *Backend) runtimeDataToBuffer(data interface{}, shape shapes.Shape) (*Buffer, error) {
+// The runtime returns narrowed types ([]int32, []float32) because CoreML doesn't
+// support Int64/Float64. The buffer stores native Go types matching the shape DType,
+// so this function widens the data when needed (int32→int64, float32→float64).
+func (b *Backend) runtimeDataToBuffer(data any, shape shapes.Shape) (*Buffer, error) {
 	if data == nil {
 		return nil, errors.New("runtime output data is nil")
 	}
 
-	// Create a new buffer with the expected shape
 	buffer := b.NewBuffer(shape)
 	if buffer == nil {
 		return nil, errors.New("failed to allocate buffer")
 	}
 
-	// Copy data into the buffer
-	switch srcData := data.(type) {
-	case []float32:
-		if dstData, ok := buffer.flat.([]float32); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []float32, buffer has %T", buffer.flat)
+	// Copy runtime data into the buffer, widening if the shape dtype is
+	// wider than what CoreML returned.
+	switch dst := buffer.flat.(type) {
+	case []int64:
+		// Runtime returns []int32; widen to []int64.
+		src, ok := data.([]int32)
+		if !ok {
+			return nil, errors.Errorf("runtimeDataToBuffer: expected []int32 for Int64 shape, got %T", data)
+		}
+		for i, v := range src {
+			dst[i] = int64(v)
 		}
 	case []float64:
-		if dstData, ok := buffer.flat.([]float64); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []float64, buffer has %T", buffer.flat)
+		// Runtime returns []float32; widen to []float64.
+		src, ok := data.([]float32)
+		if !ok {
+			return nil, errors.Errorf("runtimeDataToBuffer: expected []float32 for Float64 shape, got %T", data)
 		}
-	case []int32:
-		if dstData, ok := buffer.flat.([]int32); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []int32, buffer has %T", buffer.flat)
-		}
-	case []int64:
-		if dstData, ok := buffer.flat.([]int64); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []int64, buffer has %T", buffer.flat)
-		}
-	case []uint8:
-		if dstData, ok := buffer.flat.([]uint8); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []uint8, buffer has %T", buffer.flat)
-		}
-	case []int16:
-		if dstData, ok := buffer.flat.([]int16); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []int16, buffer has %T", buffer.flat)
-		}
-	case []uint16:
-		if dstData, ok := buffer.flat.([]uint16); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []uint16, buffer has %T", buffer.flat)
-		}
-	case []uint32:
-		if dstData, ok := buffer.flat.([]uint32); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []uint32, buffer has %T", buffer.flat)
-		}
-	case []uint64:
-		if dstData, ok := buffer.flat.([]uint64); ok {
-			if len(srcData) != len(dstData) {
-				return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", len(dstData), len(srcData))
-			}
-			copy(dstData, srcData)
-		} else {
-			return nil, errors.Errorf("type mismatch: expected []uint64, buffer has %T", buffer.flat)
+		for i, v := range src {
+			dst[i] = float64(v)
 		}
 	default:
-		return nil, errors.Errorf("unsupported runtime data type: %T", data)
+		// Types match (e.g. []float32→[]float32, []int32→[]int32).
+		srcVal := reflect.ValueOf(data)
+		dstVal := reflect.ValueOf(buffer.flat)
+		if srcVal.Type() != dstVal.Type() {
+			return nil, errors.Errorf("type mismatch: runtime returned %T, buffer storage is %T (shape dtype=%s)",
+				data, buffer.flat, shape.DType)
+		}
+		if srcVal.Len() != dstVal.Len() {
+			return nil, errors.Errorf("data size mismatch: expected %d elements, got %d", dstVal.Len(), srcVal.Len())
+		}
+		reflect.Copy(dstVal, srcVal)
 	}
 
 	return buffer, nil
 }
-
-// Unused functions for reference (kept to show the pattern, but not needed for current implementation)
-var _ = unsafe.Pointer(nil)
-var _ = reflect.TypeOf(nil)

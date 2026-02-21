@@ -40,26 +40,18 @@ func TestClip(t *testing.T) {
 		t.Fatal("expected block specialization for CoreML7")
 	}
 
-	// Should have: 1 clip op + 1 output identity (constants are inline, not separate operations)
-	if len(block.Operations) < 2 {
-		t.Errorf("expected at least 2 operations, got %d", len(block.Operations))
-	}
-
-	// Find the clip operation
-	foundClip := false
+	// Clip is implemented as Maximum(x, min) then Minimum(result, max),
+	// so we expect maximum + minimum ops (not a single "clip" op).
+	opTypeCount := make(map[string]int)
 	for _, op := range block.Operations {
-		if op.Type == "clip" {
-			foundClip = true
-			// Verify inputs
-			if len(op.Inputs) != 3 {
-				t.Errorf("clip should have 3 inputs (x, min, max), got %d", len(op.Inputs))
-			}
-			break
-		}
+		opTypeCount[op.Type]++
 	}
 
-	if !foundClip {
-		t.Error("clip operation not found in program")
+	if opTypeCount["maximum"] < 1 {
+		t.Error("expected maximum operation in program (Clip lower bound)")
+	}
+	if opTypeCount["minimum"] < 1 {
+		t.Error("expected minimum operation in program (Clip upper bound)")
 	}
 }
 
@@ -128,6 +120,76 @@ func TestCast(t *testing.T) {
 	}
 }
 
+func TestFloorFloat(t *testing.T) {
+	b := NewBuilder("main")
+	x := b.Input("x", Float32, 2, 3)
+	y := b.Floor(x)
+	b.Output("y", y)
+
+	program := b.Build()
+	block := program.Functions["main"].BlockSpecializations["CoreML7"]
+
+	foundFloor := false
+	for _, op := range block.Operations {
+		if op.Type == "floor" {
+			foundFloor = true
+			break
+		}
+	}
+	if !foundFloor {
+		t.Error("floor operation not found for float input")
+	}
+}
+
+func TestFloorIntegerPassthrough(t *testing.T) {
+	b := NewBuilder("main")
+	x := b.Input("x", Int32, 2, 3)
+	y := b.Floor(x)
+	b.Output("y", y)
+
+	// Floor of int is identity — should produce no floor op
+	program := b.Build()
+	block := program.Functions["main"].BlockSpecializations["CoreML7"]
+
+	for _, op := range block.Operations {
+		if op.Type == "floor" {
+			t.Error("floor operation should not be emitted for integer input")
+		}
+	}
+}
+
+func TestCeilIntegerPassthrough(t *testing.T) {
+	b := NewBuilder("main")
+	x := b.Input("x", Int32, 2, 3)
+	y := b.Ceil(x)
+	b.Output("y", y)
+
+	program := b.Build()
+	block := program.Functions["main"].BlockSpecializations["CoreML7"]
+
+	for _, op := range block.Operations {
+		if op.Type == "ceil" {
+			t.Error("ceil operation should not be emitted for integer input")
+		}
+	}
+}
+
+func TestRoundIntegerPassthrough(t *testing.T) {
+	b := NewBuilder("main")
+	x := b.Input("x", Int32, 2, 3)
+	y := b.Round(x)
+	b.Output("y", y)
+
+	program := b.Build()
+	block := program.Functions["main"].BlockSpecializations["CoreML7"]
+
+	for _, op := range block.Operations {
+		if op.Type == "round" {
+			t.Error("round operation should not be emitted for integer input")
+		}
+	}
+}
+
 func TestClipBroadcast(t *testing.T) {
 	b := NewBuilder("main")
 
@@ -156,16 +218,16 @@ func TestClipBroadcast(t *testing.T) {
 		t.Fatal("expected block specialization for CoreML7")
 	}
 
-	// Find the clip operation
-	foundClip := false
+	// Clip is implemented as Maximum + Minimum, verify both are present.
+	opTypeCount := make(map[string]int)
 	for _, op := range block.Operations {
-		if op.Type == "clip" {
-			foundClip = true
-			break
-		}
+		opTypeCount[op.Type]++
 	}
 
-	if !foundClip {
-		t.Error("clip operation not found in program")
+	if opTypeCount["maximum"] < 1 {
+		t.Error("expected maximum operation in program (Clip lower bound)")
+	}
+	if opTypeCount["minimum"] < 1 {
+		t.Error("expected minimum operation in program (Clip upper bound)")
 	}
 }

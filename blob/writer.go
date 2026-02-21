@@ -125,7 +125,7 @@ func (w *Writer) Close() error {
 }
 
 // writeStructAt writes a struct at the specified offset using little-endian encoding.
-func (w *Writer) writeStructAt(offset int64, data interface{}) error {
+func (w *Writer) writeStructAt(offset int64, data any) error {
 	if _, err := w.file.Seek(offset, io.SeekStart); err != nil {
 		return err
 	}

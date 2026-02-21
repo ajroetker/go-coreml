@@ -6,6 +6,7 @@ package coreml
 
 import (
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/gomlx/go-coreml/model"
@@ -182,8 +183,10 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *backends
 		// Note: We do NOT append to f.builder.inputs, inputNames, or inputShapes
 		// because closure parameters are not model-level inputs
 	} else {
-		// For the main function, create a proper model input
-		// Use sanitized name for CoreML compatibility
+		// For the main function, create a proper model input.
+		// gomlxDTypeToMIL already maps Int64→Int32 and Float64→Float32,
+		// so the I/O type matches what MLMultiArray supports.
+		// buffer.go handles the Int64↔Int32 conversion at the Go level.
 		milValue = f.builder.milBuilder.Input(sanitizedName, milDType, dims...)
 		node = f.builder.newNode(backends.OpTypeParameter, shape, milValue)
 		f.builder.inputs = append(f.builder.inputs, node)
@@ -225,18 +228,12 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 		)
 	}
 
-	// Convert to MIL dtype (note: Int64 maps to Int32 for CoreML compatibility)
+	// Convert to MIL dtype
 	milDType, err := gomlxDTypeToMIL(dtype)
 	if err != nil {
 		return nil, errors.Wrap(err, "Constant")
 	}
 
-	// If the GoMLX dtype is Int64 but MIL dtype is Int32, convert the data.
-	// This keeps the GoMLX shape as Int64 (for onnx-gomlx compatibility) while
-	// giving CoreML Int32 data (which it supports).
-	// Values that exceed Int32 range are clamped — this is safe for ML models
-	// where out-of-range Int64 constants are typically attention mask values
-	// (large negatives) where the exact magnitude doesn't matter.
 	milData := flat
 	// CoreML does not support float64 — downcast to float32.
 	if dtype == dtypes.Float64 {
@@ -249,9 +246,24 @@ func (f *Function) Constant(flat any, dims ...int) (backends.Value, error) {
 		milDType = model.Float32
 		shape = shapes.Make(dtypes.Float32, dims...)
 	}
-	if dtype == dtypes.Int64 && milDType == model.Int32 {
+
+	// CoreML does not support int64 operations — downcast to int32.
+	// GoMLX shape stays Int64 for onnx-gomlx compatibility; buffer.go
+	// handles the Int64↔Int32 conversion at I/O boundaries.
+	if dtype == dtypes.Int64 {
 		int64Data := flat.([]int64)
-		milData = convertInt64ToInt32Clamped(int64Data)
+		int32Data := make([]int32, len(int64Data))
+		for i, v := range int64Data {
+			if v > math.MaxInt32 {
+				int32Data[i] = math.MaxInt32
+			} else if v < math.MinInt32 {
+				int32Data[i] = math.MinInt32
+			} else {
+				int32Data[i] = int32(v)
+			}
+		}
+		milData = int32Data
+		milDType = model.Int32
 	}
 
 	// Convert dimensions to int64
@@ -466,18 +478,16 @@ func (f *Function) addBinaryOp(
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
 	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
-	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
-	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	// CoreML maps Int64→Int32, so both MIL values are Int32, but GoMLX shapes
+	// may differ. Unify to Int64 for shape inference so onnx-gomlx sees consistent types.
 	lhsValue := lhsNode.milValue
 	rhsValue := rhsNode.milValue
 	lhsShape := lhsNode.shape
 	rhsShape := rhsNode.shape
 
 	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
-		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
 		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
 	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
-		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
 		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
 	}
 
@@ -522,18 +532,16 @@ func (f *Function) addComparisonOp(
 	lhsNode, rhsNode := inputs[0], inputs[1]
 
 	// Handle dtype mismatch between Int32 and Int64 at the GoMLX level.
-	// Since CoreML maps Int64→Int32, both MIL values are Int32, but GoMLX shapes
-	// might differ. Unify to Int64 for shape inference (the actual MIL ops use Int32).
+	// CoreML maps Int64→Int32, so both MIL values are Int32, but GoMLX shapes
+	// may differ. Unify to Int64 for shape inference so onnx-gomlx sees consistent types.
 	lhsValue := lhsNode.milValue
 	rhsValue := rhsNode.milValue
 	lhsShape := lhsNode.shape
 	rhsShape := rhsNode.shape
 
 	if lhsShape.DType == dtypes.Int32 && rhsShape.DType == dtypes.Int64 {
-		// Promote LHS shape to Int64 for shape inference (MIL values are already both Int32)
 		lhsShape = shapes.Make(dtypes.Int64, lhsShape.Dimensions...)
 	} else if lhsShape.DType == dtypes.Int64 && rhsShape.DType == dtypes.Int32 {
-		// Promote RHS shape to Int64 for shape inference (MIL values are already both Int32)
 		rhsShape = shapes.Make(dtypes.Int64, rhsShape.Dimensions...)
 	}
 
@@ -1488,9 +1496,18 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 	}
 	operand := inputs[0]
 
+	// Remember the requested GoMLX dtype before any downcasting.
+	gomlxDType := dtype
+
 	// CoreML does not support float64 operations — downcast to float32.
 	if dtype == dtypes.Float64 {
 		dtype = dtypes.Float32
+	}
+	// CoreML does not support int64 operations — downcast to int32.
+	// GoMLX shape keeps Int64 so onnx-gomlx sees consistent types;
+	// buffer.go handles Int64↔Int32 at I/O boundaries.
+	if dtype == dtypes.Int64 {
+		dtype = dtypes.Int32
 	}
 
 	// Convert GoMLX dtype to CoreML dtype
@@ -1499,9 +1516,12 @@ func (f *Function) ConvertDType(x backends.Value, dtype dtypes.DType) (backends.
 		return nil, errors.Wrapf(err, "ConvertDType to %s", dtype)
 	}
 
-	// Output shape is the same as input, just with different dtype
+	// Output shape preserves the originally requested GoMLX dtype (Int64,
+	// Float64) so onnx-gomlx and callers see consistent types.
+	// The actual MIL operation uses the downcast dtype; the widening back
+	// to Int64/Float64 happens at the runtime I/O boundary.
 	outputShape := operand.shape.Clone()
-	outputShape.DType = dtype
+	outputShape.DType = gomlxDType
 
 	// Call the MIL Cast operation
 	resultValue := f.builder.milBuilder.Cast(operand.milValue, milDType)

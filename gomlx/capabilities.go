@@ -123,7 +123,7 @@ var Capabilities = backends.Capabilities{
 		dtypes.Int8:    true,
 		dtypes.Int16:   true,
 		dtypes.Int32:   true,
-		dtypes.Int64:   true,
+		dtypes.Int64:   true, // Silently downcast to Int32 — CoreML doesn't support int64 ops.
 		dtypes.Bool:    true,
 	},
 }

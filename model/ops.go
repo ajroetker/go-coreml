@@ -193,24 +193,48 @@ func (b *Builder) Minimum(x, y *Value) *Value {
 }
 
 // Floor computes element-wise floor: z = floor(x).
+// For integer types this is an identity operation, and CoreML's ios17.floor
+// only accepts float types, so we short-circuit.
 func (b *Builder) Floor(x *Value) *Value {
+	if isIntegerDType(x.dtype) {
+		return b.Identity(b.genName("floor"), x)
+	}
 	return b.addOp("floor", map[string]*Value{
 		"x": x,
 	}, b.genName("floor"), x.dtype, x.shape)
 }
 
 // Ceil computes element-wise ceiling: z = ceil(x).
+// For integer types this is an identity operation, and CoreML's ios17.ceil
+// only accepts float types, so we short-circuit.
 func (b *Builder) Ceil(x *Value) *Value {
+	if isIntegerDType(x.dtype) {
+		return b.Identity(b.genName("ceil"), x)
+	}
 	return b.addOp("ceil", map[string]*Value{
 		"x": x,
 	}, b.genName("ceil"), x.dtype, x.shape)
 }
 
 // Round computes element-wise rounding: z = round(x).
+// For integer types this is an identity operation, and CoreML's ios17.round
+// only accepts float types, so we short-circuit.
 func (b *Builder) Round(x *Value) *Value {
+	if isIntegerDType(x.dtype) {
+		return b.Identity(b.genName("round"), x)
+	}
 	return b.addOp("round", map[string]*Value{
 		"x": x,
 	}, b.genName("round"), x.dtype, x.shape)
+}
+
+// isIntegerDType returns true if the dtype is an integer type.
+func isIntegerDType(dt DType) bool {
+	switch dt {
+	case Int8, Int16, Int32, Int64:
+		return true
+	}
+	return false
 }
 
 // Sign computes element-wise sign: z = sign(x).
@@ -664,7 +688,7 @@ func (b *Builder) ExpandDims(x *Value, axes []int64) *Value {
 
 	// Build output shape
 	srcIdx := 0
-	for i := 0; i < outRank; i++ {
+	for i := range outRank {
 		if normalizedAxes[int64(i)] {
 			outShape[i] = 1
 		} else {
@@ -910,7 +934,7 @@ func (b *Builder) MaxPool(x *Value, kernelSize, strides []int64, padType ConvPad
 	copy(outShape[:2], x.shape[:2]) // Copy N, C dimensions
 
 	// Compute spatial dimensions based on padding type
-	for i := 0; i < len(kernelSize); i++ {
+	for i := range kernelSize {
 		spatialIdx := 2 + i
 		inputSize := x.shape[spatialIdx]
 		kernelSz := kernelSize[i]
@@ -927,7 +951,7 @@ func (b *Builder) MaxPool(x *Value, kernelSize, strides []int64, padType ConvPad
 			padTotal = padBefore[i] + padAfter[i]
 		}
 
-		outShape[spatialIdx] = (inputSize + padTotal - kernelSz) / stride + 1
+		outShape[spatialIdx] = (inputSize+padTotal-kernelSz)/stride + 1
 	}
 
 	kernelVal := b.Const(b.genName("kernel_sizes"), Int32, []int64{int64(len(kernelSize))}, toInt32Slice(kernelSize))
@@ -988,7 +1012,7 @@ func (b *Builder) AvgPool(x *Value, kernelSize, strides []int64, padType ConvPad
 	outShape := make([]int64, len(x.shape))
 	copy(outShape[:2], x.shape[:2]) // Copy N, C dimensions
 
-	for i := 0; i < len(kernelSize); i++ {
+	for i := range kernelSize {
 		spatialIdx := 2 + i
 		inputSize := x.shape[spatialIdx]
 		kernelSz := kernelSize[i]
@@ -1004,7 +1028,7 @@ func (b *Builder) AvgPool(x *Value, kernelSize, strides []int64, padType ConvPad
 			padTotal = padBefore[i] + padAfter[i]
 		}
 
-		outShape[spatialIdx] = (inputSize + padTotal - kernelSz) / stride + 1
+		outShape[spatialIdx] = (inputSize+padTotal-kernelSz)/stride + 1
 	}
 
 	kernelVal := b.Const(b.genName("kernel_sizes"), Int32, []int64{int64(len(kernelSize))}, toInt32Slice(kernelSize))
@@ -1276,9 +1300,9 @@ func (b *Builder) Range1D(start, end, step *Value) *Value {
 													endVal := endVals.Values[0]
 													stepVal := stepVals.Values[0]
 													if stepVal > 0 && endVal > startVal {
-														outputSize = int64((endVal-startVal+stepVal-1) / stepVal)
+														outputSize = int64((endVal - startVal + stepVal - 1) / stepVal)
 													} else if stepVal < 0 && endVal < startVal {
-														outputSize = int64((startVal-endVal-stepVal-1) / -stepVal)
+														outputSize = int64((startVal - endVal - stepVal - 1) / -stepVal)
 													}
 												}
 											}
@@ -1337,8 +1361,8 @@ func (b *Builder) Conv(x, weight *Value, strides, dilations []int64, padType Con
 	case ConvPadValid:
 		padTypeStr = "valid"
 		// Output size with no padding
-		outH = (inH - dilations[0]*(kH-1) - 1) / strides[0] + 1
-		outW = (inW - dilations[1]*(kW-1) - 1) / strides[1] + 1
+		outH = (inH-dilations[0]*(kH-1)-1)/strides[0] + 1
+		outW = (inW-dilations[1]*(kW-1)-1)/strides[1] + 1
 
 	case ConvPadSame:
 		padTypeStr = "same"
@@ -1357,8 +1381,8 @@ func (b *Builder) Conv(x, weight *Value, strides, dilations []int64, padType Con
 		}
 		paddedH := inH + padBefore[0] + padAfter[0]
 		paddedW := inW + padBefore[1] + padAfter[1]
-		outH = (paddedH - dilations[0]*(kH-1) - 1) / strides[0] + 1
-		outW = (paddedW - dilations[1]*(kW-1) - 1) / strides[1] + 1
+		outH = (paddedH-dilations[0]*(kH-1)-1)/strides[0] + 1
+		outW = (paddedW-dilations[1]*(kW-1)-1)/strides[1] + 1
 	}
 
 	outShape := []int64{N, Cout, outH, outW}
@@ -1745,10 +1769,7 @@ func toInt32Slice(s []int64) []int32 {
 }
 
 func broadcastShape(a, b []int64) []int64 {
-	maxLen := len(a)
-	if len(b) > maxLen {
-		maxLen = len(b)
-	}
+	maxLen := max(len(b), len(a))
 
 	result := make([]int64, maxLen)
 	for i := 0; i < maxLen; i++ {
@@ -1770,11 +1791,7 @@ func broadcastShape(a, b []int64) []int64 {
 			result[maxLen-1-i] = ai
 		} else {
 			// Incompatible shapes - return larger
-			if ai > bi {
-				result[maxLen-1-i] = ai
-			} else {
-				result[maxLen-1-i] = bi
-			}
+			result[maxLen-1-i] = max(ai, bi)
 		}
 	}
 	return result

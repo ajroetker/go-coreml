@@ -180,7 +180,9 @@ CoreMLTensor coreml_tensor_create_with_data(int64_t* shape, int rank, int dtype,
 
         // Copy data
         size_t elemSize = (dtype == COREML_DTYPE_FLOAT16) ? 2 : 4;
-        memcpy(array.dataPointer, data, total * elemSize);
+        if (total > 0) {
+            memcpy(array.dataPointer, data, total * elemSize);
+        }
     }
 
     return tensor;
@@ -293,7 +295,9 @@ bool coreml_model_predict(CoreMLModel model,
             }
 
             size_t elemSize = (resultArray.dataType == MLMultiArrayDataTypeFloat16) ? 2 : 4;
-            memcpy(outArray.dataPointer, resultArray.dataPointer, total * elemSize);
+            if (total > 0) {
+                memcpy(outArray.dataPointer, resultArray.dataPointer, total * elemSize);
+            }
         }
 
         return true;

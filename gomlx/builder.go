@@ -6,7 +6,6 @@ package coreml
 
 import (
 	"fmt"
-	"math"
 	"reflect"
 
 	"github.com/gomlx/go-coreml/model"
@@ -107,10 +106,21 @@ func (b *Builder) Compile() (backends.Executable, error) {
 
 	b.outputs = b.mainFn.outputs
 
-	// Track output metadata and mark outputs in the MIL builder
+	// Track output metadata and mark outputs in the MIL builder.
+	// MLMultiArray (CoreML I/O) doesn't support Int64 or Float64, so cast
+	// these to Int32/Float32 at the boundary. The GoMLX shape stays
+	// Int64/Float64 — buffer.go handles the narrowing/widening conversions
+	// at the Go level.
 	for i, node := range b.outputs {
 		outputName := fmt.Sprintf("output_%d", i)
-		b.milBuilder.Output(outputName, node.milValue)
+		outputValue := node.milValue
+		switch node.shape.DType {
+		case dtypes.Int64:
+			outputValue = b.milBuilder.Cast(outputValue, model.Int32)
+		case dtypes.Float64:
+			outputValue = b.milBuilder.Cast(outputValue, model.Float32)
+		}
+		b.milBuilder.Output(outputName, outputValue)
 		b.outputNames = append(b.outputNames, outputName)
 		b.outputShapes = append(b.outputShapes, node.shape)
 	}
@@ -202,29 +212,10 @@ func checkFlat(flat any) (dtype dtypes.DType, flatLen int, err error) {
 	return dtype, flatLen, nil
 }
 
-// convertInt64ToInt32Clamped converts an int64 slice to int32 slice, clamping
-// out-of-range values to math.MinInt32 / math.MaxInt32. This is safe for ML
-// models where out-of-range constants are typically attention mask sentinel
-// values where the exact magnitude doesn't matter.
-func convertInt64ToInt32Clamped(data []int64) []int32 {
-	result := make([]int32, len(data))
-	for i, v := range data {
-		switch {
-		case v < math.MinInt32:
-			result[i] = math.MinInt32
-		case v > math.MaxInt32:
-			result[i] = math.MaxInt32
-		default:
-			result[i] = int32(v)
-		}
-	}
-	return result
-}
-
 // gomlxDTypeToMIL converts a GoMLX DType to a CoreML MIL DType.
-// Note: Int64 is mapped to Int32 because CoreML doesn't support Int64 for many
-// operations (e.g., identity op). ONNX models commonly use Int64 for indices/axes
-// which always fit in Int32.
+// CoreML runtime operators do not support Int64 or Float64 — these are mapped
+// to Int32 and Float32 respectively. The GoMLX shape level may still report
+// Int64/Float64 for compatibility with onnx-gomlx.
 func gomlxDTypeToMIL(dtype dtypes.DType) (model.DType, error) {
 	switch dtype {
 	case dtypes.Float16:
@@ -232,7 +223,7 @@ func gomlxDTypeToMIL(dtype dtypes.DType) (model.DType, error) {
 	case dtypes.Float32:
 		return model.Float32, nil
 	case dtypes.Float64:
-		return model.Float64, nil
+		return model.Float32, nil
 	case dtypes.Int8:
 		return model.Int8, nil
 	case dtypes.Int16:
@@ -240,8 +231,6 @@ func gomlxDTypeToMIL(dtype dtypes.DType) (model.DType, error) {
 	case dtypes.Int32:
 		return model.Int32, nil
 	case dtypes.Int64:
-		// CoreML doesn't support Int64 for many operations (identity, etc.)
-		// Map to Int32 - indices/axes in ML models always fit in Int32
 		return model.Int32, nil
 	case dtypes.Bool:
 		return model.Bool, nil

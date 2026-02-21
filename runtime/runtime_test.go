@@ -36,7 +36,7 @@ func TestRuntimeCompileAndRun(t *testing.T) {
 	input := []float32{-1, 2, -3, 4, -5, 6}
 
 	// Run
-	outputs, err := exec.Run(map[string]interface{}{"x": input})
+	outputs, err := exec.Run(map[string]any{"x": input})
 	if err != nil {
 		t.Fatalf("Run failed: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRuntimeAddMul(t *testing.T) {
 	input := []float32{1, 2, 3, 4}
 
 	// Run
-	outputs, err := exec.Run(map[string]interface{}{"x": input})
+	outputs, err := exec.Run(map[string]any{"x": input})
 	if err != nil {
 		t.Fatalf("Run failed: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestRuntimeMatMul(t *testing.T) {
 	inputY := []float32{7, 8, 9, 10, 11, 12}
 
 	// Run
-	outputs, err := exec.Run(map[string]interface{}{
+	outputs, err := exec.Run(map[string]any{
 		"x": inputX,
 		"y": inputY,
 	})
@@ -167,7 +167,7 @@ func TestRuntimeWithComputeUnits(t *testing.T) {
 	defer exec.Close()
 
 	input := []float32{-1, 2, -3, 4}
-	outputs, err := exec.Run(map[string]interface{}{"x": input})
+	outputs, err := exec.Run(map[string]any{"x": input})
 	if err != nil {
 		t.Fatalf("Run failed: %v", err)
 	}

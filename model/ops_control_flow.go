@@ -78,7 +78,7 @@ func (bb *BlockBuilder) BlockOutput(name string, v *Value) {
 }
 
 // Const creates a constant tensor value within this block.
-func (bb *BlockBuilder) Const(name string, dtype DType, shape []int64, data interface{}) *Value {
+func (bb *BlockBuilder) Const(name string, dtype DType, shape []int64, data any) *Value {
 	val := createValue(dtype, shape, data)
 	v := &Value{
 		name:     name,
