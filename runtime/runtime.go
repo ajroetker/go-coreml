@@ -217,75 +217,51 @@ func (r *Runtime) CompileProgram(program *model.Program, inputs, outputs []model
 }
 
 // Run executes the model with the given inputs.
-// Inputs should be a map from input name to data ([]float32, []int32, etc.).
-// Returns a map from output name to data.
-func (e *Executable) Run(inputs map[string]interface{}) (map[string]interface{}, error) {
+func (e *Executable) Run(inputs map[string]any) (map[string]any, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Create input tensors
+	// Create input tensors.
 	inputTensors := make([]*bridge.Tensor, len(e.inputNames))
+	defer closeTensors(inputTensors)
 	for i, name := range e.inputNames {
 		data, ok := inputs[name]
 		if !ok {
 			return nil, fmt.Errorf("missing input: %s", name)
 		}
-
 		tensor, err := createTensor(e.inputShapes[i], data)
 		if err != nil {
-			// Clean up already created tensors
-			for j := 0; j < i; j++ {
-				inputTensors[j].Close()
-			}
 			return nil, fmt.Errorf("create input tensor %s: %w", name, err)
 		}
 		inputTensors[i] = tensor
 	}
 
-	// Create output tensors
+	// Create output tensors.
 	outputTensors := make([]*bridge.Tensor, len(e.outputNames))
+	defer closeTensors(outputTensors)
 	for i, shape := range e.outputShapes {
 		bridgeDType := modelDTypeToBridge(e.outputDTypes[i])
-		tensor, err := bridge.NewTensor(shape, bridgeDType)
+		tensor, err := bridge.NewTensor(scalarToOneDim(shape), bridgeDType)
 		if err != nil {
-			// Clean up
-			for _, t := range inputTensors {
-				t.Close()
-			}
-			for j := 0; j < i; j++ {
-				outputTensors[j].Close()
-			}
 			return nil, fmt.Errorf("create output tensor: %w", err)
 		}
 		outputTensors[i] = tensor
 	}
 
-	// Run prediction
-	err := e.model.Predict(e.inputNames, inputTensors, e.outputNames, outputTensors)
-
-	// Clean up input tensors
-	for _, t := range inputTensors {
-		t.Close()
-	}
-
-	if err != nil {
-		for _, t := range outputTensors {
-			t.Close()
-		}
+	// Run prediction.
+	if err := e.model.Predict(e.inputNames, inputTensors, e.outputNames, outputTensors); err != nil {
 		return nil, fmt.Errorf("prediction failed: %w", err)
 	}
 
-	// Extract output data
-	result := make(map[string]interface{})
+	// Extract output data.
+	result := make(map[string]any, len(e.outputNames))
 	for i, name := range e.outputNames {
 		data, err := extractTensorData(outputTensors[i])
-		outputTensors[i].Close()
 		if err != nil {
 			return nil, fmt.Errorf("extract output %s: %w", name, err)
 		}
 		result[name] = data
 	}
-
 	return result, nil
 }
 
@@ -307,19 +283,38 @@ func (e *Executable) Close() error {
 	return nil
 }
 
-// createTensor creates a bridge.Tensor from Go data.
-func createTensor(shape []int64, data interface{}) (*bridge.Tensor, error) {
-	// Handle scalar tensors: CoreML requires shape [1] for scalars
-	// This matches the handling in serialize.go featureSpecToType
-	actualShape := shape
-	if len(shape) == 0 {
-		actualShape = []int64{1}
+// closeTensors closes all non-nil tensors in the slice.
+func closeTensors(tensors []*bridge.Tensor) {
+	for _, t := range tensors {
+		if t != nil {
+			t.Close()
+		}
 	}
+}
+
+// scalarToOneDim normalises a shape for CoreML: scalars (rank-0) become [1]
+// because CoreML's MLMultiArray doesn't support rank-0 tensors.
+func scalarToOneDim(shape []int64) []int64 {
+	if len(shape) == 0 {
+		return []int64{1}
+	}
+	return shape
+}
+
+// createTensor creates a bridge.Tensor from Go data.
+func createTensor(shape []int64, data any) (*bridge.Tensor, error) {
+	actualShape := scalarToOneDim(shape)
 
 	switch d := data.(type) {
 	case []float32:
+		if len(d) == 0 {
+			return bridge.NewTensor(actualShape, bridge.DTypeFloat32)
+		}
 		return bridge.NewTensorWithData(actualShape, bridge.DTypeFloat32, unsafe.Pointer(&d[0]))
 	case []float64:
+		if len(d) == 0 {
+			return bridge.NewTensor(actualShape, bridge.DTypeFloat32)
+		}
 		// Convert to float32
 		f32 := make([]float32, len(d))
 		for i, v := range d {
@@ -327,8 +322,14 @@ func createTensor(shape []int64, data interface{}) (*bridge.Tensor, error) {
 		}
 		return bridge.NewTensorWithData(actualShape, bridge.DTypeFloat32, unsafe.Pointer(&f32[0]))
 	case []int32:
+		if len(d) == 0 {
+			return bridge.NewTensor(actualShape, bridge.DTypeInt32)
+		}
 		return bridge.NewTensorWithData(actualShape, bridge.DTypeInt32, unsafe.Pointer(&d[0]))
 	case []int64:
+		if len(d) == 0 {
+			return bridge.NewTensor(actualShape, bridge.DTypeInt32)
+		}
 		// Convert to int32
 		i32 := make([]int32, len(d))
 		for i, v := range d {
@@ -341,14 +342,29 @@ func createTensor(shape []int64, data interface{}) (*bridge.Tensor, error) {
 }
 
 // extractTensorData extracts data from a bridge.Tensor.
-func extractTensorData(tensor *bridge.Tensor) (interface{}, error) {
+func extractTensorData(tensor *bridge.Tensor) (any, error) {
 	shape := tensor.Shape()
 	size := int64(1)
 	for _, dim := range shape {
 		size *= dim
 	}
 
+	// Zero-element tensors (e.g. shape [0]) have nil data pointers.
+	if size == 0 {
+		switch tensor.DType() {
+		case bridge.DTypeFloat32:
+			return []float32{}, nil
+		case bridge.DTypeInt32:
+			return []int32{}, nil
+		default:
+			return nil, fmt.Errorf("unsupported dtype: %v", tensor.DType())
+		}
+	}
+
 	ptr := tensor.DataPtr()
+	if ptr == nil {
+		return nil, fmt.Errorf("tensor data pointer is nil (dtype=%v, shape=%v, size=%d)", tensor.DType(), shape, size)
+	}
 	switch tensor.DType() {
 	case bridge.DTypeFloat32:
 		data := make([]float32, size)

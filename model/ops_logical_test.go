@@ -97,11 +97,17 @@ func TestIsNanIsFinite(t *testing.T) {
 		opTypeCount[op.Type]++
 	}
 
-	// Check ops are present
-	expectedOps := []string{"isnan", "isfinite"}
-	for _, exp := range expectedOps {
-		if opTypeCount[exp] < 1 {
-			t.Errorf("expected %s operation in program", exp)
-		}
+	// IsNan is implemented as NotEqual(x, x) since NaN != NaN.
+	if opTypeCount["not_equal"] < 1 {
+		t.Error("expected not_equal operation in program (IsNan)")
+	}
+
+	// IsFinite is implemented as LogicalAnd(Equal(x,x), Equal(x*0, x*0)),
+	// so we expect mul, equal, and logical_and ops.
+	if opTypeCount["equal"] < 1 {
+		t.Error("expected equal operation in program (IsFinite)")
+	}
+	if opTypeCount["logical_and"] < 1 {
+		t.Error("expected logical_and operation in program (IsFinite)")
 	}
 }

@@ -6,9 +6,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/google/uuid"
 	"github.com/gomlx/go-coreml/proto/coreml/milspec"
 	"github.com/gomlx/go-coreml/proto/coreml/spec"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -102,14 +102,16 @@ func featureSpecToType(fs FeatureSpec) *spec.FeatureType {
 		copy(shape, fs.Shape)
 	}
 
-	// Map dtype to ArrayFeatureType_ArrayDataType
+	// Map dtype to ArrayFeatureType_ArrayDataType.
+	// MLMultiArray only supports Float32, Float16, Double, and Int32.
+	// Int64 is mapped to Int32 at the I/O boundary.
 	var arrayDType spec.ArrayFeatureType_ArrayDataType
 	switch fs.DType {
 	case Float32:
 		arrayDType = spec.ArrayFeatureType_FLOAT32
 	case Float64:
-		arrayDType = spec.ArrayFeatureType_DOUBLE
-	case Int32:
+		arrayDType = spec.ArrayFeatureType_FLOAT32
+	case Int32, Int64:
 		arrayDType = spec.ArrayFeatureType_INT32
 	case Float16:
 		arrayDType = spec.ArrayFeatureType_FLOAT16
@@ -167,10 +169,10 @@ func SaveMLPackage(model *spec.Model, path string) error {
 	// The manifest uses UUIDs as keys for itemInfoEntries
 	modelUUID := uuid.New().String()
 
-	manifest := map[string]interface{}{
+	manifest := map[string]any{
 		"fileFormatVersion": "1.0.0",
-		"itemInfoEntries": map[string]interface{}{
-			modelUUID: map[string]interface{}{
+		"itemInfoEntries": map[string]any{
+			modelUUID: map[string]any{
 				"author":      "com.apple.CoreML",
 				"description": "CoreML Model Specification",
 				"name":        "model.mlmodel",
