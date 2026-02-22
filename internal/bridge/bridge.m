@@ -31,7 +31,15 @@ static void set_error(CoreMLError* error, int code, NSError* nsError) {
     if (error == NULL) return;
     error->code = code;
     if (nsError != nil) {
-        error->message = strdup([[nsError localizedDescription] UTF8String]);
+        // Capture full error chain: localizedDescription + underlying errors
+        NSMutableString* msg = [NSMutableString stringWithString:[nsError localizedDescription]];
+        NSError* underlying = nsError.userInfo[NSUnderlyingErrorKey];
+        while (underlying != nil) {
+            [msg appendFormat:@"\n  caused by [%@ %ld]: %@",
+                underlying.domain, (long)underlying.code, [underlying localizedDescription]];
+            underlying = underlying.userInfo[NSUnderlyingErrorKey];
+        }
+        error->message = strdup([msg UTF8String]);
     } else {
         error->message = NULL;
     }
