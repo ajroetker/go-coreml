@@ -428,6 +428,9 @@ type Program = milspec.Program
 
 // Build constructs the final MIL Program.
 func (b *Builder) Build() *Program {
+	// Optimize: eliminate operations with rank > 5 for CoreML compatibility.
+	b.optimizeHighRankOps()
+
 	// Build function inputs
 	inputs := make([]*milspec.NamedValueType, len(b.inputs))
 	for i, v := range b.inputs {
